@@ -60,14 +60,9 @@ static int PsyX_Pad_MergeAllControllers(LPPADRAW pad);
  * idle controller never buzzes. */
 static int g_activeControllerSlot = 0;
 
-/* Touch controls live in the port (pc_touch.c), which knows about game state;
- * declared rather than included so PsyCross keeps no pc_port include path. */
-extern "C" void Pc_Touch_Update(void);
-extern "C" void Pc_Touch_NoteOtherInput(int padAttached, int keyWord);
-extern "C" int  Pc_Touch_Active(void);
-extern "C" void Pc_Touch_GetPad(unsigned short* word,
-                                unsigned char* rightX, unsigned char* rightY,
-                                unsigned char* leftX,  unsigned char* leftY);
+/* Touch controls live in the host (the port's pc_touch.c), which registers
+ * them here. A host without touch leaves them NULL and still links. */
+extern "C" { PsyX_TouchHooks g_PsyX_TouchHooks = { NULL, NULL, NULL, NULL }; }
 
 /* Steam Controller support is desktop-only. A phone has no Steam client to
  * hold the pad, and SDL's mobile HID layers reach a Steam Controller over
@@ -716,13 +711,15 @@ void PsyX_Pad_InternalPadUpdates()
 			}
 		}
 
-		Pc_Touch_NoteOtherInput(attached, (int)kbInputs);
+		if (g_PsyX_TouchHooks.noteOtherInput)
+			g_PsyX_TouchHooks.noteOtherInput(attached, (int)kbInputs);
 	}
 
 	/* Rebuild the virtual touch pad here rather than from the frame loop: this
 	 * is the one place guaranteed to run exactly once per pad read, so the
 	 * gesture state a read sees can never be a frame stale or a frame early. */
-	Pc_Touch_Update();
+	if (g_PsyX_TouchHooks.update)
+		g_PsyX_TouchHooks.update();
 
 	for (int i = 0; i < MAX_CONTROLLERS; i++)
 	{
@@ -777,12 +774,12 @@ void PsyX_Pad_InternalPadUpdates()
 			 * no gamepad is open) and BEFORE the keyboard merge, so a physical
 			 * key can still add presses on top. id 0x73 is what makes the game
 			 * read the sticks at all -- 0x41 is digital-only. */
-			if (i == 0 && Pc_Touch_Active())
+			if (i == 0 && g_PsyX_TouchHooks.active && g_PsyX_TouchHooks.getPad && g_PsyX_TouchHooks.active())
 			{
 				unsigned short tw = 0xFFFF;
 				unsigned char  rx = 128, ry = 128, lx = 128, ly = 128;
 
-				Pc_Touch_GetPad(&tw, &rx, &ry, &lx, &ly);
+				g_PsyX_TouchHooks.getPad(&tw, &rx, &ry, &lx, &ly);
 
 				*(u_short*)pad->buttons &= tw;
 				/* Only the sticks a finger is on. A centred value means "not

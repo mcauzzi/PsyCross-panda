@@ -150,6 +150,19 @@ typedef int (*PsyX_SfxOverrideFn)(int spuAddr, const short** outPcm, int* outSam
                                   int* outRate);
 extern PsyX_SfxOverrideFn			g_PsyX_SfxOverride;
 
+/* Optional touch controls. They live in the host, which knows the game state;
+ * the pad read calls them once per read. Any member may be NULL, and all are by
+ * default, which means no touch input. */
+typedef struct
+{
+	void (*update)(void);
+	void (*noteOtherInput)(int padAttached, int keyWord);
+	int  (*active)(void);
+	void (*getPad)(unsigned short* word, unsigned char* rightX, unsigned char* rightY,
+	               unsigned char* leftX, unsigned char* leftY);
+} PsyX_TouchHooks;
+extern PsyX_TouchHooks				g_PsyX_TouchHooks;
+
 /* PC port: per-pixel flashlight cone parameters, pushed once per frame by game
  * code (bodyprog world-lighting setup). Position and direction are in VIEW
  * (camera) space — the same space as the per-vertex GrVertex.vsx/vsy/vsz the GTE
