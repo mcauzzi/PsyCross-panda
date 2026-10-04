@@ -47,6 +47,7 @@ int strcasecmp(const char* _l, const char* _r)
 #else
 #include <strings.h>
 #endif
+#include <time.h>
 #define _stricmp(s1, s2) strcasecmp(s1, s2)
 #endif // _WIN32
 
@@ -225,9 +226,84 @@ int PsyX_Sys_GetVBlankCount()
 	return g_psxSysCounters[PsxCounter_VBLANK];
 }
 
+/* Each period is timed from the moment the previous one fired, so a late wake
+ * would slow the VBlank and the sequencer: sleep short of the deadline and spin
+ * the rest. Capped at 2 ms so PsyX_SPUAL_Update keeps its old cadence. Without
+ * this the thread spun a whole core, which on handhelds throttled the clocks
+ * the game thread runs on. */
+static void Intr_Doze(double left)
+{
+#ifdef _WIN32
+	if (left > 0.0025)
+		SDL_Delay(1);
+#else
+	double s = left - 0.0003;
+	if (s <= 0.0)
+		return;
+	if (s > 0.002)
+		s = 0.002;
+	struct timespec ts = { 0, (long)(s * 1e9) };
+	nanosleep(&ts, NULL);
+#endif
+}
+
+#if defined(__ANDROID__)
+#include <sched.h>
+#include <unistd.h>
+
+/* Once this thread sleeps the scheduler rates it a light task and parks it on
+ * the little cores, where on handhelds the system UI keeps them busy: a wake
+ * then waits up to ~10 ms for a core, the VBlank and the sound driver tick
+ * late, the game slows and short sound effects are lost. */
+static void Intr_AvoidLittleCores(void)
+{
+	cpu_set_t set;
+	long      freq[CPU_SETSIZE];
+	long      lowest = 0;
+	int       n = (int)sysconf(_SC_NPROCESSORS_CONF), i, picked = 0;
+
+	if (n > CPU_SETSIZE)
+		n = CPU_SETSIZE;
+	for (i = 0; i < n; i++)
+	{
+		char  path[96];
+		FILE* f;
+
+		freq[i] = 0;
+		snprintf(path, sizeof(path), "/sys/devices/system/cpu/cpu%d/cpufreq/cpuinfo_max_freq", i);
+		if ((f = fopen(path, "r")) != NULL)
+		{
+			if (fscanf(f, "%ld", &freq[i]) != 1)
+				freq[i] = 0;
+			fclose(f);
+		}
+		if (freq[i] > 0 && (lowest == 0 || freq[i] < lowest))
+			lowest = freq[i];
+	}
+
+	CPU_ZERO(&set);
+	for (i = 0; i < n; i++)
+	{
+		if (freq[i] > lowest)
+		{
+			CPU_SET(i, &set);
+			picked++;
+		}
+	}
+	if (picked > 0)
+		sched_setaffinity(0, sizeof(set), &set);
+}
+#endif
+
 int intrThreadMain(void* data)
 {
 	timerCtx_t rcnt2Timer;
+
+#if defined(__ANDROID__)
+	Intr_AvoidLittleCores();
+	SDL_SetThreadPriority(SDL_THREAD_PRIORITY_HIGH);
+#endif
+
 	Util_InitHPCTimer(&g_vblTimer);
 	Util_InitHPCTimer(&rcnt2Timer);
 
@@ -237,9 +313,10 @@ int intrThreadMain(void* data)
 
 	while (!g_stopIntrThread)
 	{
+		const double timestep = g_vmode == MODE_NTSC ? FIXED_TIME_STEP_NTSC : FIXED_TIME_STEP_PAL;
+
 		// step counters
 		{
-			const double timestep = g_vmode == MODE_NTSC ? FIXED_TIME_STEP_NTSC : FIXED_TIME_STEP_PAL;
 			const double vblDelta = Util_GetHPCTime(&g_vblTimer, 0);
 
 			if (vblDelta > timestep)
@@ -276,6 +353,17 @@ int intrThreadMain(void* data)
 		 * g_SpuMutex (never nested under g_intrMutex), throttles on the
 		 * SDL_GetTicks ms delta, no-op unless `adsr 1`. */
 		PsyX_SPUAL_Update();
+
+		{
+			double left = timestep - Util_GetHPCTime(&g_vblTimer, 0);
+			if (g_rcnt2_timer_active)
+			{
+				const double r = rcnt2Period - Util_GetHPCTime(&rcnt2Timer, 0);
+				if (r < left)
+					left = r;
+			}
+			Intr_Doze(left);
+		}
 	}
 
 	return 0;
