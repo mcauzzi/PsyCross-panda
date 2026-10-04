@@ -49,6 +49,63 @@ bool g_spatialRequested = false;
 int  g_spatialSpeakers = 0;
 uint32_t g_idealNativePhase = 0;
 
+struct OneShot
+{
+    const int16_t* samples;
+    uint32_t frames;
+    uint32_t sourceRate;
+    double pos;
+    float gainL, gainR;
+};
+
+constexpr int kOneShotMax = 8;
+OneShot g_oneShots[kOneShotMax];
+int g_oneShotNext = 0;
+
+/* Added after the core has rendered, in the core's own int16 scale (the
+ * double path carries the same scale). Linear interpolation is enough for
+ * short effects; outputRate is the rate the frames are produced at. The
+ * master volume is applied as the core applies it to its voices, so the
+ * game's master fades (SdSetMVol) take the clips down with everything else. */
+template <typename T>
+void MixOneShots(T* out, uint32_t frames, uint32_t outputRate, bool clampToS16)
+{
+    int16_t masterL, masterR;
+    g_spu().GetCurrentMasterVolume(&masterL, &masterR);
+    const double mL = masterL / 32768.0;
+    const double mR = masterR / 32768.0;
+
+    for (OneShot& s : g_oneShots)
+    {
+        if (!s.samples)
+            continue;
+        const double step = static_cast<double>(s.sourceRate) / static_cast<double>(outputRate);
+        for (uint32_t f = 0; f < frames; ++f)
+        {
+            const uint32_t i = static_cast<uint32_t>(s.pos);
+            if (i >= s.frames)
+            {
+                s.samples = nullptr;
+                break;
+            }
+            const double frac = s.pos - i;
+            const double a = s.samples[i];
+            const double b = i + 1 < s.frames ? s.samples[i + 1] : 0.0;
+            const double v = a + (b - a) * frac;
+            double l = static_cast<double>(out[f * 2]) + v * s.gainL * mL;
+            double r = static_cast<double>(out[f * 2 + 1]) + v * s.gainR * mR;
+            if (clampToS16)
+            {
+                l = std::min(32767.0, std::max(-32768.0, l));
+                r = std::min(32767.0, std::max(-32768.0, r));
+            }
+            out[f * 2] = static_cast<T>(l);
+            out[f * 2 + 1] = static_cast<T>(r);
+            s.pos += step;
+        }
+    }
+}
+
 void EnsureConfig()
 {
     if (!g_audioConfigured)
@@ -85,6 +142,7 @@ uint32_t RenderAudio(void*, int16_t* output, uint32_t frames)
         g_spu().PushCdStereoFrame(xa[i * 2], xa[i * 2 + 1]);
 
     g_spu().RenderFrames(output, static_cast<int>(frames));
+    MixOneShots(output, frames, 44100u, true);
     SDL_UnlockMutex(g_spuMutex);
     return frames;
 }
@@ -118,6 +176,7 @@ uint32_t RenderAudioFloat64(void*, double* output, uint32_t frames)
             g_spu().PushCdStereoFrame(xa[i * 2], xa[i * 2 + 1]);
     }
     g_spu().RenderFramesDouble(output, static_cast<int>(frames));
+    MixOneShots(output, frames, g_spu().GetNativeSampleRate(), false);
     SDL_UnlockMutex(g_spuMutex);
     return frames;
 }
@@ -229,6 +288,8 @@ int PsyX_SPUAL_InitSound()
     PsyX_ReferenceXA_Reset(g_referenceXa);
     g_xaPaused = false;
     g_idealNativePhase = 0;
+    for (OneShot& s : g_oneShots)
+        s.samples = nullptr;
     SDL_UnlockMutex(g_spuMutex);
 
     EnsureConfig();
@@ -617,6 +678,25 @@ u_int PsyX_SPUAL_GetQueuedXaFrames(void)
     }
     SDL_UnlockMutex(g_spuMutex);
     return result;
+}
+
+/* The spatial sink renders through its own pump, which never reaches
+ * MixOneShots: refuse there so the caller falls back instead of going silent. */
+int PsyX_SPUAL_PlayOneShot(const short* samples, u_int frames, int sourceRate, float gainL, float gainR)
+{
+    if (!g_initialized || !samples || frames == 0 || sourceRate <= 0 || PsyX_SPUSpatial_Active())
+        return 0;
+    SDL_LockMutex(g_spuMutex);
+    OneShot& s = g_oneShots[g_oneShotNext];
+    g_oneShotNext = (g_oneShotNext + 1) % kOneShotMax;
+    s.samples = samples;
+    s.frames = frames;
+    s.sourceRate = static_cast<uint32_t>(sourceRate);
+    s.pos = 0.0;
+    s.gainL = gainL;
+    s.gainR = gainR;
+    SDL_UnlockMutex(g_spuMutex);
+    return 1;
 }
 
 #if defined(PSYX_NO_OPENAL)

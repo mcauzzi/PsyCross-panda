@@ -201,6 +201,18 @@ void PsyX_AudioSetXaMasterGain(double gain);
 void PsyX_AudioSetXaPaused(int paused);
 uint32_t PsyX_AudioGetQueuedXaFrames(void);
 
+/* Mixes a mono 16-bit clip into the software SPU's output, outside the 24
+ * voices, so it needs no SPU RAM and steals no voice. The samples are not
+ * copied and must stay valid until the clip has played. Returns 0 when the
+ * active output has no mixer of its own (the OpenAL backend, the spatial
+ * sink): the caller has to play the clip some other way. */
+int PsyX_AudioPlayOneShot(
+	const int16_t* samples,
+	uint32_t frames,
+	uint32_t source_rate,
+	float gain_left,
+	float gain_right);
+
 #if defined(_LANGUAGE_C_PLUS_PLUS) || defined(__cplusplus) || defined(c_plusplus)
 }
 #endif

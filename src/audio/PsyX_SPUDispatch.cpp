@@ -65,6 +65,7 @@ int PsyX_SPUSoftware_IsXaDrained();
 void PsyX_SPUSoftware_SetXaMasterGain(double);
 void PsyX_SPUSoftware_SetXaPaused(int);
 u_int PsyX_SPUSoftware_GetQueuedXaFrames();
+int PsyX_SPUSoftware_PlayOneShot(const short*, u_int, int, float, float);
 
 #undef DECLARE_BACKEND
 }
@@ -260,6 +261,13 @@ int PsyX_AudioIsXaDrained() { return PsyX_SPUAL_IsXaDrained(); }
 void PsyX_AudioSetXaMasterGain(double gain) { PsyX_SPUAL_SetXaMasterGain(gain); }
 void PsyX_AudioSetXaPaused(int paused) { PsyX_SPUAL_SetXaPaused(paused); }
 uint32_t PsyX_AudioGetQueuedXaFrames() { return PsyX_SPUAL_GetQueuedXaFrames(); }
+int PsyX_AudioPlayOneShot(const int16_t* samples, uint32_t frames, uint32_t sourceRate,
+	float gainLeft, float gainRight)
+{
+	return UseSoftware()
+		? PsyX_SPUSoftware_PlayOneShot(samples, frames, (int)sourceRate, gainLeft, gainRight)
+		: 0;
+}
 
 #undef DISPATCH_RETURN
 #undef DISPATCH_VOID
