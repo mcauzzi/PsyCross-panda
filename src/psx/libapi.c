@@ -1,3 +1,8 @@
+/* Newer mingw-w64 pulls <io.h> in via <wchar.h> (SDL_stdinc.h), whose
+ * POSIX open/lseek/read/write prototypes clash with the PSX shims below. */
+#if defined(__MINGW32__) && !defined(NO_OLDNAMES)
+#define NO_OLDNAMES
+#endif
 #include "psx/libapi.h"
 #include "psx/libmcrd.h"
 #include "psx/kernel.h"
