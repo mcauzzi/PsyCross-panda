@@ -23,6 +23,71 @@
 #ifndef __glad_h_
 #define __glad_h_
 
+/* Android links the platform's real GLES3 library directly — PsyX_render.h
+ * leaves USE_GLAD undefined there and includes <GLES3/gl3.h> itself, so glad's
+ * loader is never initialised on this platform and its glad_glXxx function
+ * pointers would all be NULL at call time.
+ *
+ * Several translation units include this header directly rather than going
+ * through PsyX_render.h. Whichever include landed first used to win: the ones
+ * that reached glad.h first compiled against desktop-GL declarations that would
+ * have crashed at runtime, and the ones that reached the GLES header first
+ * tripped the #error guards below. Forwarding to the platform headers here
+ * makes every consumer correct regardless of include order. */
+#if defined(__APPLE__)
+#   include <TargetConditionals.h>
+#endif
+
+/* Also defined in PsyX/PsyX_render.h — see the note there. iOS renders into
+ * SDL's CAEAGLLayer framebuffer, not object 0, so "unbind to the screen" has to
+ * name it. Compile-time 0 on every other platform. */
+#ifndef PSYX_DEFAULT_FBO
+#   if defined(__APPLE__) && TARGET_OS_IPHONE
+#       ifdef __cplusplus
+extern "C" unsigned int g_PsyX_DefaultFBO;
+#       else
+extern unsigned int g_PsyX_DefaultFBO;
+#       endif
+#       define PSYX_DEFAULT_FBO (g_PsyX_DefaultFBO)
+#   else
+#       define PSYX_DEFAULT_FBO 0
+#   endif
+#endif
+
+#if defined(__ANDROID__)
+#   include <GLES3/gl3.h>
+#   include <GLES2/gl2ext.h>
+#elif defined(__APPLE__) && TARGET_OS_IPHONE
+/* Same forward as Android, to Apple's framework layout. Without it glad's
+ * `#define glActiveTexture glad_glActiveTexture` function-pointer shims collide
+ * with the real declarations in OpenGLES/ES3/gl.h ("redefinition as a different
+ * kind of symbol") in every TU that reaches this header before that one. */
+#   include <OpenGLES/ES3/gl.h>
+#   include <OpenGLES/ES3/glext.h>
+
+/* Also shimmed in PsyX/PsyX_render.h — see the note there. The renderer now
+ * picks between the desktop and GLES spellings at RUNTIME (g_grCaps), which
+ * needs the desktop tokens to at least EXIST for that half of each branch to
+ * compile; Apple ships real ES 3.0 headers, where they do not. Registry values,
+ * defined only so the branch parses — every one sits behind a capability flag
+ * that is false on any GLES context, so none is ever handed to the driver. */
+#   ifndef GL_TEXTURE_WIDTH
+#       define GL_TEXTURE_WIDTH             0x1000
+#   endif
+#   ifndef GL_TEXTURE_HEIGHT
+#       define GL_TEXTURE_HEIGHT            0x1001
+#   endif
+#   ifndef GL_TEXTURE_INTERNAL_FORMAT
+#       define GL_TEXTURE_INTERNAL_FORMAT   0x1003
+#   endif
+#   ifndef GL_TEXTURE_BORDER_COLOR
+#       define GL_TEXTURE_BORDER_COLOR      0x1004
+#   endif
+#   ifndef GL_CLAMP_TO_BORDER
+#       define GL_CLAMP_TO_BORDER           0x812D
+#   endif
+#else
+
 #ifdef __gl_h_
 #error OpenGL header already included, remove this include, glad already provides it
 #endif
@@ -3534,5 +3599,7 @@ GLAPI int GLAD_GL_KHR_debug;
 #ifdef __cplusplus
 }
 #endif
+
+#endif /* !mobile GLES — see the platform-header forward at the top */
 
 #endif

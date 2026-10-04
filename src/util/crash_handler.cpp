@@ -186,9 +186,127 @@ void UnInstallExceptionHandler()
 
 #else
 
+/* POSIX targets used to install nothing at all, which is why an iOS crash left
+ * literally no evidence: no console anyone can read, and a sideloaded build does
+ * not reliably produce a system crash report either. A fatal signal simply ended
+ * the process mid-frame and the log stopped wherever its last flush had reached.
+ *
+ * Catch the fatal signals and write a backtrace to a file next to the log
+ * (Documents on iOS, so Files.app can retrieve it). Everything here is
+ * async-signal-safe on purpose: raw write(2) and backtrace_symbols_fd, no
+ * printf, no malloc, no stdio.
+ *
+ * This also answers a question that guessing cannot: if the file APPEARS the
+ * process took a fatal signal and the trace names the frame. If it does NOT
+ * appear, nothing was signalled and the process was SIGKILLed from outside --
+ * jetsam, the watchdog, or a GPU fault -- which is a completely different
+ * investigation. */
+
+#include <signal.h>
+#include <string.h>
+#include <unistd.h>
+#include <fcntl.h>
+
+/* Android defines __linux__ but is not glibc. Bionic only declares backtrace()
+ * and backtrace_symbols_fd() from API 33, and this builds against minSdk 21, so
+ * <execinfo.h> resolves while the functions do not exist -- "use of undeclared
+ * identifier 'backtrace'" rather than a missing header. Everything below is
+ * compiled out there, and InstallExceptionHandler becomes the no-op it already
+ * is on any platform without a backtrace. Android has its own crash reporting
+ * (tombstones, logcat) regardless. */
+#if (defined(__APPLE__) || defined(__linux__)) && !defined(__ANDROID__)
+#   include <execinfo.h>
+#   define PSYX_HAVE_BACKTRACE 1
+#endif
+
+#if defined(PSYX_HAVE_BACKTRACE)
+
+static void PsyX_WriteStr(int fd, const char* s)
+{
+	if (fd >= 0 && s)
+		(void)!write(fd, s, strlen(s));
+}
+
+static void PsyX_CrashSignalHandler(int sig)
+{
+	/* A fault inside the handler must not recurse forever. */
+	static volatile sig_atomic_t s_inHandler = 0;
+
+	void* frames[64];
+	int   n;
+	int   fd;
+
+	if (s_inHandler)
+		_exit(128 + sig);
+	s_inHandler = 1;
+
+	n = backtrace(frames, (int)(sizeof(frames) / sizeof(frames[0])));
+
+	fd = open("SilentHill_crash.txt", O_WRONLY | O_CREAT | O_APPEND, 0644);
+
+	PsyX_WriteStr(fd, "\n=== fatal signal: ");
+	PsyX_WriteStr(fd, sig == SIGSEGV ? "SIGSEGV" :
+	                  sig == SIGBUS  ? "SIGBUS"  :
+	                  sig == SIGILL  ? "SIGILL"  :
+	                  sig == SIGFPE  ? "SIGFPE"  :
+	                  sig == SIGABRT ? "SIGABRT" : "other");
+	PsyX_WriteStr(fd, " ===\n");
+
+	if (fd >= 0)
+		backtrace_symbols_fd(frames, n, fd);
+	backtrace_symbols_fd(frames, n, STDERR_FILENO);
+
+	if (fd >= 0)
+	{
+		(void)!write(fd, "\n", 1);
+		close(fd);
+	}
+
+	_exit(128 + sig);
+}
+
+#endif /* PSYX_HAVE_BACKTRACE */
+
 void InstallExceptionHandler()
 {
-	
+#if defined(PSYX_HAVE_BACKTRACE)
+	struct sigaction sa;
+
+	memset(&sa, 0, sizeof(sa));
+	sa.sa_handler = PsyX_CrashSignalHandler;
+	sigemptyset(&sa.sa_mask);
+	/* NODEFER so a fault inside the handler reaches the recursion guard rather
+	 * than deadlocking; RESETHAND so the second one dies normally. */
+	sa.sa_flags = SA_NODEFER | SA_RESETHAND;
+
+	/* Never displace a handler the host already installed.
+	 *
+	 * pc_port's Sh_InstallCrashFilter takes these same five signals, and it runs
+	 * FIRST -- main_pc.c installs it long before PsyX_Initialise reaches this.
+	 * Overwriting it would have swapped a handler that flushes the game log and
+	 * prints module+offset frames (ASLR-proof, resolvable with addr2line) for
+	 * this one, which does neither. The log losing its last buffered second is
+	 * precisely what made an Android crash report undiagnosable.
+	 *
+	 * So this is the fallback for a host that installs nothing, and stands down
+	 * for one that does. */
+	{
+		static const int kSignals[] = { SIGSEGV, SIGBUS, SIGILL, SIGFPE, SIGABRT };
+		unsigned i;
+
+		for (i = 0; i < sizeof(kSignals) / sizeof(kSignals[0]); i++)
+		{
+			struct sigaction cur;
+
+			memset(&cur, 0, sizeof(cur));
+			if (sigaction(kSignals[i], NULL, &cur) == 0 &&
+			    cur.sa_handler != SIG_DFL && cur.sa_handler != SIG_IGN)
+				continue;
+
+			sigaction(kSignals[i], &sa, NULL);
+		}
+	}
+#endif
 }
 
 void UnInstallExceptionHandler()

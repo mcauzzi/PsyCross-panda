@@ -10,6 +10,16 @@
 //-----------------------------------------------------------------------
 
 #if defined(__APPLE__)
+#   include <TargetConditionals.h>
+#endif
+
+/* macOS links a system/Homebrew SDL2, which installs its headers under an SDL2/
+ * prefix. iOS builds SDL from the submodule as a subdirectory target, and that
+ * exports its include dir directly, so the prefixed form does not resolve --
+ * same as Android. */
+#if defined(__APPLE__) && TARGET_OS_IPHONE
+#   include <SDL.h>
+#elif defined(__APPLE__)
 #   include <SDL2/SDL.h>
 #elif defined(__EMSCRIPTEN__)
 #   include <emscripten/emscripten.h>
@@ -29,19 +39,17 @@
 
 #include "PsyX/PsyX_globals.h"
 
-#if defined(__ANDROID__)
-#   include <android/log.h>
-#   define LOG_TAG_EMU "[PsyX] "
-#   define eprintf(fmt, ...)       __android_log_print(ANDROID_LOG_DEBUG, LOG_TAG_EMU, fmt, ##__VA_ARGS__)
-#   define eprintinfof(fmt, ...)   __android_log_print(ANDROID_LOG_DEBUG, LOG_TAG_EMU " [INFO]", fmt, ##__VA_ARGS__)
-#   define eprintwarnf(fmt, ...)   __android_log_print(ANDROID_LOG_DEBUG, LOG_TAG_EMU " [WARN]", fmt, ##__VA_ARGS__)
-#   define eprinterr(fmt, ...)     eprintf("[%s] - " fmt, FUNCNAME, ##__VA_ARGS__);
-#else
-#   define eprintf(fmt, ...)       PsyX_Log("[Psy-X] " fmt, ##__VA_ARGS__)
-#   define eprintinfo(fmt, ...)    PsyX_Log_Info("[Psy-X] " fmt, ##__VA_ARGS__)
-#   define eprintwarn(fmt, ...)    PsyX_Log_Warning("[Psy-X] " fmt, ##__VA_ARGS__)
-#   define eprinterr(fmt, ...)     PsyX_Log_Error("[Psy-X] [%s] - " fmt, FUNCNAME, ##__VA_ARGS__);
-#endif
+/* Android used to get its own logging branch here, but it defined
+ * eprintinfof/eprintwarnf — names no call site in this codebase ever used (they
+ * all call eprintinfo/eprintwarn), so that branch could never have compiled and
+ * was dead upstream leftovers. Every platform now routes through PsyX_Log*,
+ * which is what puts diagnostics in g_logStream where the port's triage
+ * workflow expects to read them. SDL redirects stdout/stderr into logcat on
+ * Android, so `adb logcat` still sees this. */
+#define eprintf(fmt, ...)       PsyX_Log("[Psy-X] " fmt, ##__VA_ARGS__)
+#define eprintinfo(fmt, ...)    PsyX_Log_Info("[Psy-X] " fmt, ##__VA_ARGS__)
+#define eprintwarn(fmt, ...)    PsyX_Log_Warning("[Psy-X] " fmt, ##__VA_ARGS__)
+#define eprinterr(fmt, ...)     PsyX_Log_Error("[Psy-X] [%s] - " fmt, FUNCNAME, ##__VA_ARGS__);
 
 //-----------------------------------------------------------------------
 

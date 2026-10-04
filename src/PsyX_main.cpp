@@ -15,6 +15,10 @@
 #include "platform.h"
 #include "util/crash_handler.h"
 
+#if defined(__ANDROID__)
+#include <android/log.h>   /* PrintMessageToOutput routes the spew to logcat */
+#endif
+
 #include "psx/libetc.h"
 #include "psx/libgte.h"
 #include "psx/libgpu.h"
@@ -426,6 +430,19 @@ int PsyX_LookupGameControllerMapping(const char* str, int default_value)
 		if (!_stricmp("NONE", str))
 			return SDL_CONTROLLER_BUTTON_INVALID;
 
+		/* "joyN" = raw joystick button N, for buttons SDL's controller profile
+		 * does not describe (see CONTROLLER_MAP_FLAG_RAWBTN). */
+		if ((str[0] == 'j' || str[0] == 'J') &&
+		    (str[1] == 'o' || str[1] == 'O') &&
+		    (str[2] == 'y' || str[2] == 'Y') &&
+		    str[3] >= '0' && str[3] <= '9')
+		{
+			int raw = atoi(str + 3);
+
+			if (raw >= 0 && raw < 0x1000)
+				return CONTROLLER_MAP_FLAG_RAWBTN | raw;
+		}
+
 		// check buttons
 		for (i = 0; i < SDL_CONTROLLER_BUTTON_MAX; i++)
 		{
@@ -667,6 +684,23 @@ void PrintMessageToOutput(SpewType_t spewtype, char const* pMsgFormat, va_list a
 			console.log(UTF8ToString($0));
 		}, pTempBuffer);
 	}
+#elif defined(__ANDROID__)
+	/* An Android app's stdout goes to /dev/null unless something redirects it,
+	 * and SDL does not, so printf here threw away every diagnostic this engine
+	 * produces -- including shader compile and link failures, which is exactly
+	 * what you need when the screen is black. Route to logcat by severity so
+	 * `adb logcat -s PsyX` is the equivalent of reading SilentHill.log. */
+	{
+		int prio;
+		switch (spewtype)
+		{
+			case SPEW_INFO:    prio = ANDROID_LOG_INFO;  break;
+			case SPEW_WARNING: prio = ANDROID_LOG_WARN;  break;
+			case SPEW_ERROR:   prio = ANDROID_LOG_ERROR; break;
+			default:           prio = ANDROID_LOG_DEBUG; break;
+		}
+		__android_log_write(prio, "PsyX", pTempBuffer);
+	}
 #else
 	printf(pTempBuffer);
 #endif
@@ -811,7 +845,50 @@ void PsyX_Initialise(char* appName, int width, int height, int fullscreen)
 
 void PsyX_GetScreenSize(int* screenWidth, int* screenHeight)
 {
+/* Detected here rather than via PSYX_IOS: nothing this file includes reaches
+ * PsyX_render.h, so that macro is not defined in this translation unit and the
+ * branch would silently never be taken. TargetConditionals comes in through
+ * platform.h. */
+#if defined(__APPLE__) && TARGET_OS_IPHONE
+	/* SDL_GetWindowSize reports POINTS. With SDL_WINDOW_ALLOW_HIGHDPI the
+	 * drawable is PIXELS — 3x larger on a modern iPhone — and everything that
+	 * consumes this function works in that pixel space: glViewport, and
+	 * PsyX_MapWindowToViewport, which reasons in g_windowWidth/Height.
+	 *
+	 * Mixing the two put the FMV in a bottom-left box at a ninth of the area and
+	 * folded every touch into the same ninth, so a finger at the bottom centre
+	 * registered near the top left. Report the pixels everyone else assumes.
+	 * (Points still matter for the desktop mouse, which is why this is gated.) */
+	if (screenWidth)  *screenWidth  = g_windowWidth;
+	if (screenHeight) *screenHeight = g_windowHeight;
+#else
 	SDL_GetWindowSize(g_window, screenWidth, screenHeight);
+#endif
+}
+
+/* SDL reports mouse positions -- including the ones it synthesises from touch --
+ * in window POINTS. PsyX_MapWindowToViewport reasons in drawable PIXELS. They
+ * are the same number everywhere except iOS with high-DPI enabled, where the
+ * drawable is 3x the window on a modern iPhone, so an unscaled pointer lands at
+ * a third of its true position: touch the centre of the menu, watch the cursor
+ * appear up in the top-left corner.
+ *
+ * No-op off iOS, where window and drawable already agree. */
+extern "C" void PsyX_ScaleWindowToDrawable(int* x, int* y)
+{
+#if defined(__APPLE__) && TARGET_OS_IPHONE
+	int winW = 0, winH = 0;
+
+	SDL_GetWindowSize(g_window, &winW, &winH);
+
+	if (winW > 0 && winH > 0)
+	{
+		if (x) *x = (int)((float)*x * ((float)g_windowWidth  / (float)winW));
+		if (y) *y = (int)((float)*y * ((float)g_windowHeight / (float)winH));
+	}
+#else
+	(void)x; (void)y;
+#endif
 }
 
 void PsyX_SetCursorPosition(int x, int y)
@@ -852,10 +929,20 @@ void PsyX_Sys_DoPollEvent()
 				switch (event.window.event)
 				{
 				case SDL_WINDOWEVENT_RESIZED:
-					/* This used to assign the render size directly, which is how
-					 * borderless lost the chosen resolution: a fullscreen-desktop
-					 * window reports the DESKTOP size here right after creation. */
-					GR_ApplyPresentSize(event.window.data1, event.window.data2);
+					/* This is the SURFACE size, and the render size is derived from it.
+					 * Assigning g_windowWidth directly is how both ports lost theirs:
+					 * Android fires a resize during startup right after init computed
+					 * the scaled size, and a fullscreen-desktop window reports the
+					 * DESKTOP size here right after creation. GR_ApplyRenderScale
+					 * re-derives both, and defers to borderless where that applies. */
+					{
+						extern int g_surfaceWidth, g_surfaceHeight;
+						extern void GR_ApplyRenderScale(void);
+
+						g_surfaceWidth  = event.window.data1;
+						g_surfaceHeight = event.window.data2;
+						GR_ApplyRenderScale();
+					}
 					GR_ResetDevice();
 					break;
 				case SDL_WINDOWEVENT_CLOSE:
@@ -985,6 +1072,7 @@ char PsyX_BeginScene()
 	// set — leaving stale "street sign" garbage from the prior frame
 	// visible for a split second. Forcing a clear every frame is the
 	// PC equivalent of glClear(GL_COLOR_BUFFER_BIT) at frame start.
+
 	{
 		const RECT16 clipenv = activeDrawEnv.clip;
 		const u_char r = activeDrawEnv.isbg ? activeDrawEnv.r0 : 0;
@@ -1076,6 +1164,7 @@ void PsyX_EndScene()
 		extern void GR_PostProcess(void);
 		GR_PostProcess();
 	}
+
 
 	GR_SwapWindow();
 }
@@ -1335,6 +1424,17 @@ void PsyX_WaitForTimestep(int count)
 #ifdef __EMSCRIPTEN__
 			emscripten_sleep(0);
 #endif
+			/* Low-end: yield instead of spinning. This loop otherwise burns a
+			 * core flat out waiting for the vblank counter to tick, which on a
+			 * 4-core cabinet is a core taken from the audio and render threads
+			 * (and makes the governor see a permanently busy CPU). Sleeping
+			 * costs at most a millisecond of wait precision. */
+			{
+				extern int g_cfg_lowEnd;
+				if (g_cfg_lowEnd)
+					SDL_Delay(1);
+			}
+
 			vbl = PsyX_Sys_GetVBlankCount();
 		}
 		while (vbl - swapLastVbl < count);

@@ -9,6 +9,30 @@ list(FILTER PSYCROSS_SRCS_CPP EXCLUDE REGEX "/tests/")
 list(REMOVE_ITEM PSYCROSS_SRCS_CPP
 	"${CMAKE_CURRENT_SOURCE_DIR}/src/audio/PsyX_SPUAL.cpp")
 
+# Neither mobile target has OpenAL: Android never had it, and Apple removed its
+# OpenAL framework. PsyX_SPUSoftware renders the SPU itself and pushes through
+# SDL2's audio sink, so the legacy AL backend leaves the build here (before
+# add_library, or the removal would come too late to matter) and
+# PsyX_SPUDispatch.cpp collapses onto the software one via PSYX_NO_OPENAL.
+if(ANDROID OR IOS)
+	list(REMOVE_ITEM PSYCROSS_SRCS_CPP
+		"${CMAKE_CURRENT_SOURCE_DIR}/src/audio/PsyX_SPULegacy.cpp")
+	# PsyX_SPUSpatial.cpp routes the software SPU through OpenAL placement
+	# for surround layouts, so it includes <AL/al.h> unconditionally and
+	# cannot compile where there is no OpenAL at all. Its own header already
+	# contracts "returns false if OpenAL is unavailable", and
+	# PsyX_SPUSoftware falls through to the stereo sink on false, so the
+	# stubs in that file are the documented behaviour rather than a bypass.
+	list(REMOVE_ITEM PSYCROSS_SRCS_CPP
+		"${CMAKE_CURRENT_SOURCE_DIR}/src/audio/PsyX_SPUSpatial.cpp")
+	# glad.c is the desktop-GL entry-point loader. Both mobile targets link
+	# their GLES implementation directly (PsyX_render.h leaves USE_GLAD
+	# undefined on each), so the loader is never called and its desktop-only
+	# PFNGL*PROC types do not exist here.
+	list(REMOVE_ITEM PSYCROSS_SRCS_C
+		"${CMAKE_CURRENT_SOURCE_DIR}/src/render/glad.c")
+endif()
+
 set_source_files_properties( ${PSYCROSS_SRCS_C} PROPERTIES LANGUAGE C)
 set_source_files_properties( ${PSYCROSS_SRCS_CPP} PROPERTIES LANGUAGE CXX)
 
@@ -56,24 +80,46 @@ if(NOT WIN32)
         PROPERTIES COMPILE_OPTIONS "-fvisibility=hidden")
 endif()
 
+if(ANDROID OR IOS)
+    # SDL2 is built from source alongside this (android_port/app/jni and
+    # ios_port/CMakeLists.txt each add the submodule before us), so the target
+    # already exists — find_package would look for a system SDL2 that an NDK
+    # sysroot or iPhoneOS SDK does not have.
+    target_link_libraries(psycross_static SDL2)
+else()
 find_package(SDL2 REQUIRED)
 target_link_libraries(psycross_static ${SDL2_LIBRARIES})
 target_include_directories(psycross_static PRIVATE ${SDL2_INCLUDE_DIRS})
+endif()
 
-find_package(OpenAL REQUIRED)
-if(TARGET OpenAL::OpenAL)
-    target_link_libraries(psycross_static OpenAL::OpenAL)
-elseif(TARGET OpenAL)
-    target_link_libraries(psycross_static OpenAL)
+# The legacy AL backend is already out of the source list on Android (see the
+# REMOVE_ITEM above); PSYX_NO_OPENAL is what makes the dispatch stop referring
+# to it. PUBLIC so pc_port's TUs see the same collapsed contract.
+if(ANDROID)
+    target_compile_definitions(psycross_static PUBLIC PSYX_NO_OPENAL)
+    target_link_libraries(psycross_static GLESv3 EGL android log)
+elseif(IOS)
+    target_compile_definitions(psycross_static PUBLIC PSYX_NO_OPENAL)
+    # iOS reaches GLES through a framework, and has no EGL — SDL creates the
+    # context via EAGL. The rest of the frameworks the app needs are linked at
+    # the executable, not here.
+    target_link_libraries(psycross_static "-framework OpenGLES")
 else()
-    target_link_libraries(psycross_static ${OPENAL_LIBRARY})
-    target_include_directories(psycross_static PRIVATE ${OPENAL_INCLUDE_DIR})
-endif()
-if(OpenAL_SOURCE_DIR)
-    target_include_directories(psycross_static PRIVATE ${OpenAL_BINARY_DIR} ${OpenAL_SOURCE_DIR}/include)
-endif()
-if(OPENAL_INCLUDE_DIR)
-    target_include_directories(psycross_static PRIVATE ${OPENAL_INCLUDE_DIR})
+    find_package(OpenAL REQUIRED)
+    if(TARGET OpenAL::OpenAL)
+        target_link_libraries(psycross_static OpenAL::OpenAL)
+    elseif(TARGET OpenAL)
+        target_link_libraries(psycross_static OpenAL)
+    else()
+        target_link_libraries(psycross_static ${OPENAL_LIBRARY})
+        target_include_directories(psycross_static PRIVATE ${OPENAL_INCLUDE_DIR})
+    endif()
+    if(OpenAL_SOURCE_DIR)
+        target_include_directories(psycross_static PRIVATE ${OpenAL_BINARY_DIR} ${OpenAL_SOURCE_DIR}/include)
+    endif()
+    if(OPENAL_INCLUDE_DIR)
+        target_include_directories(psycross_static PRIVATE ${OPENAL_INCLUDE_DIR})
+    endif()
 endif()
 
 if(WIN32)

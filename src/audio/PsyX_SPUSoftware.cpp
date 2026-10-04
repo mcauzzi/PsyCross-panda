@@ -619,4 +619,48 @@ u_int PsyX_SPUAL_GetQueuedXaFrames(void)
     return result;
 }
 
+#if defined(PSYX_NO_OPENAL)
+/* Normally supplied by PsyX_SPUAL.cpp, which PSYX_NO_OPENAL leaves out of the
+ * build entirely. The game calls this unconditionally (bodyprog_bgm_80087EA8.c)
+ * to end ambient LOOPS on a scene teardown, so on a target with no OpenAL at
+ * all it has to come from the software renderer instead -- and the bug it fixes
+ * (a looping bed surviving a quickload and playing forever) is not specific to
+ * the AL mixer.
+ *
+ * NOT part of the renamed dispatch set: this name is the same on both backends,
+ * so it is guarded rather than routed, exactly like g_PsyX_SfxOverride in
+ * PsyX_SPUDispatch.cpp. On a desktop build PsyX_SPUAL.cpp owns the definition. */
+void Pc_SpuStopLoopingVoices(void)
+{
+    SDL_LockMutex(g_spuMutex);
+    g_spu().StopLoopingVoices();
+    SDL_UnlockMutex(g_spuMutex);
 }
+#endif
+
+}
+
+#if defined(PSYX_NO_OPENAL)
+/* PsyX_SPUSpatial.cpp is out of the build on a target with no OpenAL (see
+   PsyCross/CMakeLists.txt): it exists to hand the software SPU to OpenAL for
+   surround placement, and includes <AL/al.h> to do it.
+
+   Its header already contracts that Start returns false when OpenAL is
+   unavailable and that the caller then keeps the ordinary stereo sink, which
+   is exactly what SpuInit above does -- so this is the documented path, not a
+   bypass. C++ linkage deliberately: the header is not extern "C", so these
+   must sit outside the block above to match its declarations. */
+bool PsyX_SPUSpatial_Start(PsyX::SPUCore* core, SDL_mutex* coreMutex, int speakerMode)
+{
+    (void)core; (void)coreMutex; (void)speakerMode;
+    return false;
+}
+
+void PsyX_SPUSpatial_Stop(void) { }
+int  PsyX_SPUSpatial_Active(void) { return 0; }
+
+void PsyX_SPUSpatial_SetXaPump(void (*pump)(void* user, int frames), void* user)
+{
+    (void)pump; (void)user;
+}
+#endif

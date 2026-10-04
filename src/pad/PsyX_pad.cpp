@@ -27,6 +27,11 @@ typedef struct
 
 int						g_cfg_controllerToSlotMapping[MAX_CONTROLLERS] = { -1, -1 };
 
+/* PC port: SDL joystick name of the controller the player picked. While it is
+ * connected it alone sits in slot 0 and drives the game; while it is not, every
+ * controller is assigned first-come as before. Empty = Automatic. */
+char					g_cfg_preferredController[128] = "";
+
 /* PC port: movement source for the controller. 0 = analog stick only,
  * 1 = d-pad only (digital), 2 = both (default). Set from config in main_pc.c.
  * Drives whether the emulated pad sits in analog (0x73) or digital (0x41) mode. */
@@ -55,6 +60,32 @@ static int PsyX_Pad_MergeAllControllers(LPPADRAW pad);
  * idle controller never buzzes. */
 static int g_activeControllerSlot = 0;
 
+/* Touch controls live in the port (pc_touch.c), which knows about game state;
+ * declared rather than included so PsyCross keeps no pc_port include path. */
+extern "C" void Pc_Touch_Update(void);
+extern "C" void Pc_Touch_NoteOtherInput(int padAttached, int keyWord);
+extern "C" int  Pc_Touch_Active(void);
+extern "C" void Pc_Touch_GetPad(unsigned short* word,
+                                unsigned char* rightX, unsigned char* rightY,
+                                unsigned char* leftX,  unsigned char* leftY);
+
+/* Steam Controller support is desktop-only. A phone has no Steam client to
+ * hold the pad, and SDL's mobile HID layers reach a Steam Controller over
+ * Bluetooth instead: on iOS, the Steam driver hint being on is exactly what
+ * makes SDL create a CBCentralManager (src/hidapi/ios/hid.m), and enumerating
+ * Valve devices is what first asks for it. That raises a Bluetooth permission
+ * prompt at launch, and iOS terminates an app whose Info.plist carries no
+ * NSBluetoothAlwaysUsageDescription. Android's HID manager likewise starts
+ * Bluetooth only for that hint. Leaving the hint at SDL's default keeps both
+ * phones as they were. */
+#if defined(__APPLE__)
+#include <TargetConditionals.h>
+#endif
+#if !((defined(__APPLE__) && TARGET_OS_IPHONE) || defined(__ANDROID__))
+#define PSYX_STEAM_CONTROLLER 1
+#endif
+
+#if defined(PSYX_STEAM_CONTROLLER)
 /* The Steam Controller can be plugged in and still invisible to SDL: when the
  * Steam client is running it holds the device for its own desktop
  * configuration, so SDL's raw driver cannot open it and the pad behaves as a
@@ -88,6 +119,7 @@ static void PsyX_Pad_SteamControllerOwnershipHint(void)
 		        "The Steam client is holding it (desktop configuration = mouse). "
 		        "Add the game to Steam and launch it from there, or exit Steam first.\n");
 }
+#endif /* PSYX_STEAM_CONTROLLER */
 
 // Initializes SDL controllers
 int PsyX_Pad_InitSystem()
@@ -118,6 +150,7 @@ int PsyX_Pad_InitSystem()
 	 * and SteamGameId for every title it starts, non-Steam shortcuts included,
 	 * and Proton adds STEAM_COMPAT_APP_ID. The Deck hint is passed by name so
 	 * an SDL older than the one that added it just ignores it. */
+#if defined(PSYX_STEAM_CONTROLLER)
 	{
 		const int underSteam = (SDL_getenv("SteamAppId") != NULL ||
 		                        SDL_getenv("SteamGameId") != NULL ||
@@ -128,6 +161,7 @@ int PsyX_Pad_InitSystem()
 		        underSteam ? "off" : "on",
 		        underSteam ? "launched by Steam, Steam Input owns the pad" : "not launched by Steam");
 	}
+#endif
 
 	memset(g_controllers, 0, sizeof(g_controllers));
 	for (int i = 0; i < MAX_CONTROLLERS; i++)
@@ -145,7 +179,28 @@ int PsyX_Pad_InitSystem()
 	// Add more controllers from custom file
 	SDL_GameControllerAddMappingsFromFile("gamecontrollerdb.txt");
 
+	/* A pad that never raises SDL_CONTROLLERDEVICEADDED leaves controller->gc
+	 * NULL, so UpdateGameControllerInput writes "all released" every poll and
+	 * the pad is silently driven by the key path instead — which is where the
+	 * Android shared-scancode collision bites. Record what SDL actually sees so
+	 * that state is visible in the log rather than inferred from its absence. */
+	{
+		int n = SDL_NumJoysticks();
+		int i;
+
+		eprintinfo("[PAD] SDL_NumJoysticks=%d\n", n);
+
+		for (i = 0; i < n; i++)
+		{
+			const char* nm = SDL_JoystickNameForIndex(i);
+			eprintinfo("[PAD]   %d '%s' isGameController=%d\n",
+				i, nm ? nm : "?", SDL_IsGameController(i) ? 1 : 0);
+		}
+	}
+
+#if defined(PSYX_STEAM_CONTROLLER)
 	PsyX_Pad_SteamControllerOwnershipHint();
+#endif
 
 	return 1;
 }
@@ -153,7 +208,9 @@ int PsyX_Pad_InitSystem()
 // Prints controller list into console
 void PsyX_Pad_Debug_ListControllers()
 {
+#if defined(PSYX_STEAM_CONTROLLER)
 	PsyX_Pad_SteamControllerOwnershipHint();
+#endif
 
 	int numJoysticks = SDL_NumJoysticks();
 	int numHaptics = SDL_NumHaptics();
@@ -186,6 +243,58 @@ void PsyX_Pad_Debug_ListControllers()
 		eprintwarn("No SDL haptics found!\n");
 }
 
+
+/* One-shot detailed dump of a controller, for building a proper SDL mapping (or
+ * a softmod patch) for hardware whose stock profile is incomplete. Prints the
+ * GUID, the raw button/axis/hat counts and the mapping string SDL is using, so
+ * the gap between "buttons the device has" and "buttons the profile names" is
+ * visible in one place. */
+static void PsyX_Pad_DumpDeviceDetail(SDL_GameController* gc)
+{
+	SDL_Joystick* js = SDL_GameControllerGetJoystick(gc);
+	char          guid[64];
+	char*         map;
+	int           i;
+
+	if (js == NULL)
+		return;
+
+	SDL_JoystickGetGUIDString(SDL_JoystickGetGUID(js), guid, sizeof(guid));
+
+	eprintinfo("[PADINFO] name='%s' guid=%s%s",
+		SDL_JoystickName(js) ? SDL_JoystickName(js) : "?", guid, "\n");
+	eprintinfo("[PADINFO] raw buttons=%d axes=%d hats=%d balls=%d%s",
+		SDL_JoystickNumButtons(js), SDL_JoystickNumAxes(js),
+		SDL_JoystickNumHats(js), SDL_JoystickNumBalls(js), "\n");
+	eprintinfo("[PADINFO] vendor=0x%04X product=0x%04X version=0x%04X%s",
+		SDL_JoystickGetVendor(js), SDL_JoystickGetProduct(js),
+		SDL_JoystickGetProductVersion(js), "\n");
+
+	map = SDL_GameControllerMapping(gc);
+	if (map != NULL)
+	{
+		eprintinfo("[PADINFO] sdl mapping: %s%s", map, "\n");
+		SDL_free(map);
+	}
+
+	/* Which controller name each raw button currently answers to, so an unnamed
+	 * one shows up as a hole in the list rather than being invisible. */
+	for (i = 0; i < SDL_CONTROLLER_BUTTON_MAX; i++)
+	{
+		SDL_GameControllerButtonBind b =
+			SDL_GameControllerGetBindForButton(gc, (SDL_GameControllerButton)i);
+
+		if (b.bindType == SDL_CONTROLLER_BINDTYPE_BUTTON)
+			eprintinfo("[PADINFO] '%s' <- raw button %d%s",
+				SDL_GameControllerGetStringForButton((SDL_GameControllerButton)i),
+				b.value.button, "\n");
+		else if (b.bindType == SDL_CONTROLLER_BINDTYPE_HAT)
+			eprintinfo("[PADINFO] '%s' <- hat %d mask %d%s",
+				SDL_GameControllerGetStringForButton((SDL_GameControllerButton)i),
+				b.value.hat.hat, b.value.hat.hat_mask, "\n");
+	}
+}
+
 // Opens specific system controller and assigns to specified slot
 void PsyX_Pad_OpenController(Sint32 deviceId, int slot)
 {
@@ -216,24 +325,9 @@ void PsyX_Pad_OpenController(Sint32 deviceId, int slot)
 
 		eprintinfo("Controller '%s' -> slot %d (instance %d)\n",
 			SDL_GameControllerName(controller->gc), slot, (int)controller->instanceId);
-
-		/* [PADPROBE] what SDL actually made of the device: a pad can be listed
-		 * and opened yet deliver nothing (a driver or Steam holding it) or
-		 * deliver on indices its mapping does not name. */
-		{
-			SDL_Joystick* js = SDL_GameControllerGetJoystick(controller->gc);
-			char          guid[64];
-			char*         map = SDL_GameControllerMapping(controller->gc);
-
-			SDL_JoystickGetGUIDString(SDL_JoystickGetGUID(js), guid, sizeof(guid));
-			eprintinfo("[PADPROBE] slot %d vid=%04x pid=%04x type=%d buttons=%d axes=%d hats=%d guid=%s\n",
-				slot, (unsigned)SDL_JoystickGetVendor(js), (unsigned)SDL_JoystickGetProduct(js),
-				(int)SDL_GameControllerGetType(controller->gc),
-				SDL_JoystickNumButtons(js), SDL_JoystickNumAxes(js), SDL_JoystickNumHats(js), guid);
-			eprintinfo("[PADPROBE] slot %d mapping: %s\n", slot, map ? map : "(none)");
-			if (map)
-				SDL_free(map);
-		}
+		/* [PADINFO] prints all of this and the per-button raw binds with it,
+		 * so the device detail [PADPROBE] used to dump here is left to it. */
+		PsyX_Pad_DumpDeviceDetail(controller->gc);
 	}
 }
 
@@ -330,6 +424,161 @@ void PsyX_Pad_InitPad(int slot, u_char* padData)
 	}
 }
 
+static int PsyX_Pad_SlotOfInstance(SDL_JoystickID instanceId)
+{
+	int i;
+
+	for (i = 0; i < MAX_CONTROLLERS; i++)
+	{
+		if (g_controllers[i].gc && g_controllers[i].instanceId == instanceId)
+			return i;
+	}
+	return -1;
+}
+
+/* Device index of the preferred controller, -1 when none is set or it is not
+ * connected. `gone` is a device whose REMOVED event is being handled: SDL may
+ * still list it at that point. */
+static int PsyX_Pad_PreferredDeviceIndex(SDL_JoystickID gone)
+{
+	int i, n;
+
+	if (g_cfg_preferredController[0] == '\0')
+		return -1;
+
+	n = SDL_NumJoysticks();
+	for (i = 0; i < n; i++)
+	{
+		const char* nm;
+
+		if (!SDL_IsGameController(i) || SDL_JoystickGetDeviceInstanceID(i) == gone)
+			continue;
+		nm = SDL_JoystickNameForIndex(i);
+		if (nm != NULL && strcmp(nm, g_cfg_preferredController) == 0)
+			return i;
+	}
+	return -1;
+}
+
+/* Controllers held open but read by nothing while a preferred one is in use.
+ * Closing them would not silence them on Android: SDL hands the buttons of a
+ * joystick nobody has opened to the keyboard instead (A as Return, the d-pad as
+ * the arrows -- SDL_sysjoystick.c Android_OnPadDown), and the arrows are the
+ * default movement keys. */
+#define MAX_PARKED_CONTROLLERS 8
+static SDL_GameController* g_parkedControllers[MAX_PARKED_CONTROLLERS];
+
+static void PsyX_Pad_UnparkAll(void)
+{
+	int i;
+
+	for (i = 0; i < MAX_PARKED_CONTROLLERS; i++)
+	{
+		if (g_parkedControllers[i])
+			SDL_GameControllerClose(g_parkedControllers[i]);
+		g_parkedControllers[i] = NULL;
+	}
+}
+
+static void PsyX_Pad_ParkAllExcept(SDL_JoystickID keep, SDL_JoystickID gone)
+{
+	int i, n = SDL_NumJoysticks(), k = 0;
+
+	PsyX_Pad_UnparkAll();
+
+	for (i = 0; i < n && k < MAX_PARKED_CONTROLLERS; i++)
+	{
+		const SDL_JoystickID id = SDL_JoystickGetDeviceInstanceID(i);
+
+		if (!SDL_IsGameController(i) || id == keep || id == gone)
+			continue;
+
+		g_parkedControllers[k] = SDL_GameControllerOpen(i);
+		if (g_parkedControllers[k])
+		{
+			eprintinfo("[PAD] '%s' ignored (preferred controller in use)\n",
+				SDL_GameControllerName(g_parkedControllers[k]));
+			k++;
+		}
+	}
+}
+
+/* Bring the slots in line with what is connected and what the player picked.
+ *
+ * First-come assignment alone leaves the player at the mercy of enumeration
+ * order. An Android TV box lists its remote (and often an HDMI-CEC remote) as
+ * game controllers -- SDLControllerManager takes any D-pad source -- so they can
+ * fill both slots before a Bluetooth pad pairs, and the pad is then never
+ * opened at all. A preferred controller takes slot 0 and every other controller
+ * is parked, so a remote cannot drive Harry or keep the touch overlay away; the
+ * moment it disconnects the others take the slots again, so the game is never
+ * left without a controller. */
+static void PsyX_Pad_Reconcile(SDL_JoystickID gone)
+{
+	int i, s, n, pref;
+
+	/* Free any slot whose handle went stale (missed REMOVED, USB re-enumeration). */
+	for (s = 0; s < MAX_CONTROLLERS; s++)
+	{
+		if (g_controllers[s].gc && !SDL_GameControllerGetAttached(g_controllers[s].gc))
+			PsyX_Pad_CloseController(s);
+	}
+
+	pref = PsyX_Pad_PreferredDeviceIndex(gone);
+	if (pref >= 0)
+	{
+		const SDL_JoystickID want = SDL_JoystickGetDeviceInstanceID(pref);
+
+		if (!(g_controllers[0].gc && g_controllers[0].instanceId == want))
+		{
+			PsyX_Pad_UnparkAll();
+			for (s = 0; s < MAX_CONTROLLERS; s++)
+				PsyX_Pad_CloseController(s);
+			PsyX_Pad_OpenController(pref, 0);
+		}
+
+		if (g_controllers[0].gc)
+		{
+			for (s = 1; s < MAX_CONTROLLERS; s++)
+				PsyX_Pad_CloseController(s);
+			PsyX_Pad_ParkAllExcept(want, gone);
+			return;
+		}
+		eprintwarn("[PAD] preferred controller '%s' failed to open, using all controllers\n",
+			g_cfg_preferredController);
+	}
+
+	PsyX_Pad_UnparkAll();
+
+	/* Config-pinned slots accept exactly their device index; unpinned slots
+	 * accept any newcomer. Matching on controller->deviceId is wrong here: it
+	 * auto-latches the index of the FIRST device, so a pad replugged into a
+	 * different port (new index) could never rejoin its slot. */
+	n = SDL_NumJoysticks();
+	for (i = 0; i < n; i++)
+	{
+		SDL_JoystickID id;
+
+		if (!SDL_IsGameController(i))
+			continue;
+		id = SDL_JoystickGetDeviceInstanceID(i);
+		if (id == gone || PsyX_Pad_SlotOfInstance(id) >= 0)
+			continue;
+
+		for (s = 0; s < MAX_CONTROLLERS; s++)
+		{
+			if (g_controllers[s].gc)
+				continue;
+			if (g_cfg_controllerToSlotMapping[s] != -1 &&
+			    g_cfg_controllerToSlotMapping[s] != i)
+				continue;
+
+			PsyX_Pad_OpenController(i, s);
+			break;
+		}
+	}
+}
+
 // called from Psy-X SDL events
 void PsyX_Pad_Event_ControllerAdded(Sint32 deviceId)
 {
@@ -337,37 +586,12 @@ void PsyX_Pad_Event_ControllerAdded(Sint32 deviceId)
 	 * mismatch that used to strand pads. The old haptic subsystem reinit is
 	 * gone: rumble runs through SDL_GameControllerRumble, no SDL_Haptic
 	 * handles exist, and quitting the subsystem mid-event was the crash its
-	 * own FIXME warned about. */
-	int i;
-	PsyXController* controller;
+	 * own FIXME warned about. Every unopened device is considered, not just
+	 * this one, so one that found the slots full earlier gets its turn. */
+	(void)deviceId;
 
 	PsyX_Pad_Debug_ListControllers();
-
-	/* Free any slot whose handle went stale (missed REMOVED, USB re-enumeration). */
-	for (i = 0; i < MAX_CONTROLLERS; i++)
-	{
-		controller = &g_controllers[i];
-		if (controller->gc && !SDL_GameControllerGetAttached(controller->gc))
-			PsyX_Pad_CloseController(i);
-	}
-
-	/* Config-pinned slots accept exactly their device index; unpinned slots
-	 * accept any newcomer. Matching on controller->deviceId is wrong here: it
-	 * auto-latches the index of the FIRST device, so a pad replugged into a
-	 * different port (new index) could never rejoin its slot. */
-	for (i = 0; i < MAX_CONTROLLERS; i++)
-	{
-		controller = &g_controllers[i];
-
-		if (controller->gc)
-			continue;
-		if (g_cfg_controllerToSlotMapping[i] != -1 &&
-		    g_cfg_controllerToSlotMapping[i] != deviceId)
-			continue;
-
-		PsyX_Pad_OpenController(deviceId, i);
-		break;
-	}
+	PsyX_Pad_Reconcile(-1);
 }
 
 // called from Psy-X SDL events
@@ -393,7 +617,76 @@ void PsyX_Pad_Event_ControllerRemoved(Sint32 instanceId)
 		}
 	}
 
+	/* A preferred controller going away is what opens the others again. */
+	PsyX_Pad_Reconcile((SDL_JoystickID)instanceId);
+
 	PsyX_Pad_Debug_ListControllers();
+}
+
+/* PC port: connected controllers by SDL joystick name, for the in-game
+ * picker. Two identical pads share a name and are listed once -- the
+ * preference is stored by name, so they could not be told apart anyway. */
+static const char* PsyX_Pad_DistinctDeviceName(int nth, int* count)
+{
+	const char* found = NULL;
+	int         i, j, n = SDL_NumJoysticks(), k = 0;
+
+	for (i = 0; i < n; i++)
+	{
+		const char* nm;
+		int         dup = 0;
+
+		if (!SDL_IsGameController(i))
+			continue;
+		nm = SDL_JoystickNameForIndex(i);
+		if (nm == NULL || nm[0] == '\0')
+			continue;
+
+		for (j = 0; j < i && !dup; j++)
+		{
+			const char* prev = SDL_IsGameController(j) ? SDL_JoystickNameForIndex(j) : NULL;
+			dup = (prev != NULL && strcmp(prev, nm) == 0);
+		}
+		if (dup)
+			continue;
+
+		if (k == nth)
+			found = nm;
+		k++;
+	}
+
+	if (count != NULL)
+		*count = k;
+	return found;
+}
+
+extern "C" int PsyX_Pad_DeviceCount(void)
+{
+	int count;
+
+	PsyX_Pad_DistinctDeviceName(-1, &count);
+	return count;
+}
+
+extern "C" const char* PsyX_Pad_DeviceName(int n)
+{
+	return PsyX_Pad_DistinctDeviceName(n, NULL);
+}
+
+extern "C" int PsyX_Pad_PreferredControllerConnected(void)
+{
+	return PsyX_Pad_PreferredDeviceIndex(-1) >= 0;
+}
+
+extern "C" void PsyX_Pad_ApplyPreferredController(void)
+{
+	/* Before init the ADDED events SDL raises at startup do this. */
+	if (g_sdlKeyboardState == NULL)
+		return;
+
+	eprintinfo("[PAD] preferred controller: %s\n",
+		g_cfg_preferredController[0] ? g_cfg_preferredController : "(automatic)");
+	PsyX_Pad_Reconcile(-1);
 }
 
 void PsyX_Pad_InternalPadUpdates()
@@ -406,6 +699,30 @@ void PsyX_Pad_InternalPadUpdates()
 		return;
 
 	kbInputs = PsyX_Pad_UpdateKeyboardInput();
+
+	/* Let the touch layer stand aside for real hardware. Both facts are needed:
+	 * an opened GameController covers the normal case, and the key word covers
+	 * Android pads that SDL never enumerates as controllers at all. */
+	{
+		int attached = 0;
+		int i;
+
+		for (i = 0; i < MAX_CONTROLLERS; i++)
+		{
+			if (g_controllers[i].gc && SDL_GameControllerGetAttached(g_controllers[i].gc))
+			{
+				attached = 1;
+				break;
+			}
+		}
+
+		Pc_Touch_NoteOtherInput(attached, (int)kbInputs);
+	}
+
+	/* Rebuild the virtual touch pad here rather than from the frame loop: this
+	 * is the one place guaranteed to run exactly once per pad read, so the
+	 * gesture state a read sees can never be a frame stale or a frame early. */
+	Pc_Touch_Update();
 
 	for (int i = 0; i < MAX_CONTROLLERS; i++)
 	{
@@ -454,6 +771,40 @@ void PsyX_Pad_InternalPadUpdates()
 				pad->id = (g_cfg_controllerMovement == 1) ? 0x41 : 0x73;
 			}
 
+			/* Touch presents itself as an ordinary analog pad on port 1, so
+			 * nothing downstream of libpad needs to know a finger is involved.
+			 * It runs AFTER the controller read (which zeroes everything when
+			 * no gamepad is open) and BEFORE the keyboard merge, so a physical
+			 * key can still add presses on top. id 0x73 is what makes the game
+			 * read the sticks at all -- 0x41 is digital-only. */
+			if (i == 0 && Pc_Touch_Active())
+			{
+				unsigned short tw = 0xFFFF;
+				unsigned char  rx = 128, ry = 128, lx = 128, ly = 128;
+
+				Pc_Touch_GetPad(&tw, &rx, &ry, &lx, &ly);
+
+				*(u_short*)pad->buttons &= tw;
+				/* Only the sticks a finger is on. A centred value means "not
+				 * driving", and writing those over an attached controller's
+				 * sticks left it with d-pad movement only (reported with
+				 * touch_controls on Automatic). With no controller attached
+				 * the read above leaves nothing worth keeping, so the neutral
+				 * values still go in. */
+				if (!anyAttached || rx != 128 || ry != 128)
+				{
+					pad->analog[0] = rx;
+					pad->analog[1] = ry;
+				}
+				if (!anyAttached || lx != 128 || ly != 128)
+				{
+					pad->analog[2] = lx;
+					pad->analog[3] = ly;
+				}
+				pad->id        = 0x73;
+				pad->status    = 0;
+			}
+
 			// Update keyboard for PAD
 			if ((g_activeKeyboardControllers & (1 << i)) && kbInputs != 0xffff)
 			{
@@ -472,9 +823,58 @@ void PsyX_Pad_InternalPadUpdates()
 		}
 	}
 
-#if defined(__ANDROID__)
-	///@TODO SDL_NumJoysticks always reports > 0 for some reason on Android.
-#endif
+	/* Fold every other controller into player 1.
+	 *
+	 * Controllers are opened first-come into slots, so whichever device SDL
+	 * enumerates first becomes player 1 -- and that is not necessarily the one
+	 * a human is holding. On an arcade cabinet a 'Logitech USB Receiver' dongle
+	 * claimed slot 0 while the actual panel landed in slot 1, so the panel was
+	 * driving a second player this game does not have and almost nothing
+	 * responded.
+	 *
+	 * Silent Hill is single-player, so merging is strictly a gain: any pad on
+	 * the machine drives Harry, including a cabinet's second-player controls.
+	 * Purely additive -- each slot still gets its own state above, so a port
+	 * that wants pad 2 can still read it. Active-low, so AND means "pressed on
+	 * either". */
+	{
+		LPPADRAW p0 = (LPPADRAW)g_controllers[0].padData;
+		int      i;
+
+		if (p0 != NULL)
+		{
+			for (i = 1; i < MAX_CONTROLLERS; i++)
+			{
+				LPPADRAW pn = (LPPADRAW)g_controllers[i].padData;
+
+				if (pn == NULL || g_controllers[i].gc == NULL ||
+				    !SDL_GameControllerGetAttached(g_controllers[i].gc))
+					continue;
+
+				*(u_short*)p0->buttons &= *(u_short*)pn->buttons;
+
+				/* Sticks can't be OR'd, so the first deflected one wins;
+				 * a centred pad never fights one being pushed. */
+				{
+					const int n0 = (abs((int)p0->analog[0] - 128) + abs((int)p0->analog[1] - 128) +
+					                abs((int)p0->analog[2] - 128) + abs((int)p0->analog[3] - 128));
+					const int nn = (abs((int)pn->analog[0] - 128) + abs((int)pn->analog[1] - 128) +
+					                abs((int)pn->analog[2] - 128) + abs((int)pn->analog[3] - 128));
+
+					if (nn > n0)
+					{
+						p0->analog[0] = pn->analog[0];
+						p0->analog[1] = pn->analog[1];
+						p0->analog[2] = pn->analog[2];
+						p0->analog[3] = pn->analog[3];
+						p0->id        = pn->id;
+					}
+				}
+
+				p0->status = 0;
+			}
+		}
+	}
 }
 
 
@@ -502,6 +902,19 @@ extern "C" int PsyX_Pad_SkipButtonHeld(void)
 
 int GetControllerButtonState(SDL_GameController* cont, int buttonOrAxis)
 {
+	/* Raw joystick button: bypasses the controller profile entirely, which is
+	 * the only way to reach a button the profile does not name. */
+	if (buttonOrAxis & CONTROLLER_MAP_FLAG_RAWBTN)
+	{
+		SDL_Joystick* js = SDL_GameControllerGetJoystick(cont);
+		const int     raw = buttonOrAxis & 0x0FFF;
+
+		if (js == NULL || raw >= SDL_JoystickNumButtons(js))
+			return 0;
+
+		return SDL_JoystickGetButton(js, raw) * 32767;
+	}
+
 	if (buttonOrAxis & CONTROLLER_MAP_FLAG_AXIS)
 	{
 		int value = SDL_GameControllerGetAxis(cont, (SDL_GameControllerAxis)(buttonOrAxis & ~(CONTROLLER_MAP_FLAG_AXIS | CONTROLLER_MAP_FLAG_INVERSE)));
@@ -679,6 +1092,70 @@ void PsyX_Pad_UpdateGameControllerInput(PsyXController* controller, LPPADRAW pad
 	/* Primary binds AND the secondary (second-button-per-action) binds: active-low,
 	 * so an action reads pressed if EITHER mapping clears its bit. Analog sticks come
 	 * from the primary mapping's axes only. */
+	/* Report every controller button this device can produce, once each.
+	 *
+	 * The keyboard probe found nothing on an arcade cabinet because its panel is
+	 * a game controller, not a keyboard -- and which SDL buttons a panel exposes
+	 * is not guessable: a 6-button stick has no triggers and no Back, which is
+	 * exactly why Aim (R2) and Inventory (Select) did nothing there while the
+	 * face buttons worked. Press each button once and this prints the map. */
+	{
+		static unsigned char s_btnSeen[SDL_CONTROLLER_BUTTON_MAX];
+		static unsigned char s_axSeen[SDL_CONTROLLER_AXIS_MAX];
+		int b;
+
+		for (b = 0; b < SDL_CONTROLLER_BUTTON_MAX; b++)
+		{
+			if (!s_btnSeen[b] && SDL_GameControllerGetButton(cont, (SDL_GameControllerButton)b))
+			{
+				s_btnSeen[b] = 1;
+				eprintinfo("[BTN] button '%s' on '%s'\n",
+					SDL_GameControllerGetStringForButton((SDL_GameControllerButton)b),
+					SDL_GameControllerName(cont) ? SDL_GameControllerName(cont) : "?");
+			}
+		}
+
+		/* RAW joystick buttons as well. SDL_GameController only exposes buttons
+		 * its mapping covers, so a panel with more buttons than the profile
+		 * describes has some that are simply invisible above -- which is exactly
+		 * what two dead buttons on a 6-button cabinet look like. The raw device
+		 * sees every one, and the index printed here is what a binding needs. */
+		{
+			SDL_Joystick* js = SDL_GameControllerGetJoystick(cont);
+
+			if (js != NULL)
+			{
+				static unsigned char s_rawSeen[32];
+				int nb = SDL_JoystickNumButtons(js);
+				int r;
+
+				if (nb > 32) nb = 32;
+				for (r = 0; r < nb; r++)
+				{
+					if (!s_rawSeen[r] && SDL_JoystickGetButton(js, r))
+					{
+						s_rawSeen[r] = 1;
+						eprintinfo("[BTN] RAW joystick button %d on '%s'\n",
+							r, SDL_JoystickName(js) ? SDL_JoystickName(js) : "?");
+					}
+				}
+			}
+		}
+
+		/* Triggers and sticks are axes, not buttons; a panel that reports its
+		 * shoulder buttons as axes would otherwise look like it had none. */
+		for (b = 0; b < SDL_CONTROLLER_AXIS_MAX; b++)
+		{
+			if (!s_axSeen[b] && abs(SDL_GameControllerGetAxis(cont, (SDL_GameControllerAxis)b)) > 16384)
+			{
+				s_axSeen[b] = 1;
+				eprintinfo("[BTN] axis '%s' on '%s'\n",
+					SDL_GameControllerGetStringForAxis((SDL_GameControllerAxis)b),
+					SDL_GameControllerName(cont) ? SDL_GameControllerName(cont) : "?");
+			}
+		}
+	}
+
 	u_short w1 = PsyX_Pad_BuildPadWord(cont, g_cfg_controllerMapping,  controller->hystWord[0]);
 	u_short w2 = PsyX_Pad_BuildPadWord(cont, g_cfg_controllerMapping2, controller->hystWord[1]);
 	controller->hystWord[0] = w1;
@@ -833,6 +1310,32 @@ u_short PsyX_Pad_UpdateKeyboardInput()
 
 	SDL_PumpEvents();
 
+	/* Report every distinct key this machine can produce, once each.
+	 *
+	 * An arcade cabinet's controls are an encoder emitting scancodes nobody can
+	 * guess from here, and "most buttons do nothing" cannot be fixed without
+	 * knowing WHICH ones they are -- the default map (C/V/Z/X/Enter/arrows) is
+	 * a PC keyboard layout that a cabinet has no reason to match. Each scancode
+	 * logs a single line the first time it is seen, so pressing every button
+	 * once produces a complete map of the hardware and nothing after that. */
+	{
+		static unsigned char s_keySeen[SDL_NUM_SCANCODES];
+		static int           s_keyCount = 0;
+		int                  sc;
+
+		for (sc = 0; sc < SDL_NUM_SCANCODES && s_keyCount < 64; sc++)
+		{
+			if (g_sdlKeyboardState[sc] && !s_keySeen[sc])
+			{
+				const char* nm = SDL_GetScancodeName((SDL_Scancode)sc);
+
+				s_keySeen[sc] = 1;
+				s_keyCount++;
+				eprintinfo("[KEY] scancode %d = '%s'\n", sc, (nm && nm[0]) ? nm : "(unnamed)");
+			}
+		}
+	}
+
 	ret = PsyX_Pad_BuildKbWord(g_cfg_keyboardMapping);
 
 	/* Secondary key binds + mouse buttons (gated by allow_mouse_secondary,
@@ -843,6 +1346,48 @@ u_short PsyX_Pad_UpdateKeyboardInput()
 		ret &= PsyX_Pad_BuildKbWord(g_cfg_keyboardMapping2);
 		ret &= PsyX_Pad_BuildMouseWord();
 	}
+
+#if defined(__ANDROID__)
+	/* Android hands one physical gamepad button to SDL through several input
+	 * devices at once (a pad enumerates a main node plus a "Consumer Control"
+	 * node), and SDL folds them all into ONE global scancode array with no
+	 * device identity. The devices' UP/DOWN events interleave, so one node's UP
+	 * clears the shared bit while the button is still physically held. Measured
+	 * on a GameSir X5: press, 32ms, release, 16ms, press again — which the game
+	 * reads as two rising edges and hands to two different screens (Start on the
+	 * title also picking New Game; a press that skips the intro FMV also
+	 * confirming its way into the difficulty select).
+	 *
+	 * Hold a release briefly: one reversed this fast was never a real release.
+	 * Only the release edge is affected, so presses stay instant, and the window
+	 * is well under the ~120ms a deliberate double-tap takes.
+	 *
+	 * This is a repair for the shared-scancode collision, not for the pad. The
+	 * clean route is opening the device as an SDL_GameController so each node
+	 * keeps its own state — see the [PAD] enumeration logged at init. */
+	{
+		#define KB_RELEASE_HOLD_MS 40
+
+		static Uint32 s_lastPressedMs[16];
+		Uint32        now = SDL_GetTicks();
+		int           bit;
+
+		for (bit = 0; bit < 16; bit++)
+		{
+			u_short mask = (u_short)(1 << bit);
+
+			if (!(ret & mask))
+			{
+				s_lastPressedMs[bit] = now;
+			}
+			else if (s_lastPressedMs[bit] != 0 &&
+			         (now - s_lastPressedMs[bit]) < KB_RELEASE_HOLD_MS)
+			{
+				ret &= ~mask;
+			}
+		}
+	}
+#endif
 
 	return ret;
 }

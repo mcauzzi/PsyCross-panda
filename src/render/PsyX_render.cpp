@@ -4,10 +4,14 @@
 #include <windows.h>
 #endif
 
+/* Every platform, not just Windows: the VOIDPROBE readback builds its colour
+ * histogram with std::map, std::vector, std::pair and std::sort. MinGW's
+ * libstdc++ happens to pull these in through other headers, Apple's libc++
+ * does not, so inside the _WIN32 block the iOS build failed on them. */
 #include <map>
 #include <vector>
-#include <algorithm>
 #include <utility>
+#include <algorithm>
 
 #include "PsyX/PsyX_public.h"
 
@@ -130,6 +134,7 @@ int   g_PsxItemTakeActive = 0;
  * cutscenes — is unchanged. This replaces the old g_PsxCutsceneActive vscale skip
  * (which un-cropped the whole cutscene frame and looked stretched). */
 int   g_PsxUIOrthoPass = 0;
+
 /* 3D-world HORIZONTAL ortho scale (Hor+ widescreen only). 1.0 = identity (current
  * behaviour); >1 narrows the ortho around center = wider models, <1 = narrower. Pure
  * tuning/preference knob, default neutral. Console `hfov`; not applied to the UI pass. */
@@ -268,8 +273,70 @@ TextureID g_whiteTexture = -1;
 TextureID g_rgLutTexture = -1;
 TextureID g_lastBoundTexture = -1;
 
+/* RENDER size. With render scaling on this is smaller than the real surface:
+ * everything downstream (viewport, scissor, culling bounds, the 2D overlay
+ * extents) is expressed in these, so they all follow automatically and only the
+ * present step and window-pixel input have to know the difference. */
 int g_windowWidth = 0;
 int g_windowHeight = 0;
+
+/* REAL surface, always. Only the final upscale and the window->viewport input
+ * mapping use these. */
+int g_surfaceWidth = 0;
+int g_surfaceHeight = 0;
+
+/* 1.0 = render at native. Below that the frame is drawn into a smaller
+ * offscreen target and upscaled on present, which is the one setting that
+ * actually reduces PIXEL COUNT rather than per-pixel work -- the thing a weak
+ * GPU is short of. Clamped on apply; 1.0 keeps the original path exactly. */
+extern "C" { float g_cfg_renderScale = 1.0f; }
+
+/* Low-end mode: trades a little staleness for per-frame cost on weak GPUs.
+ * Gameplay is untouched -- this only affects work the renderer does every frame
+ * regardless of what is on screen. */
+extern "C" { int g_cfg_lowEnd = 0; }
+
+/* render_scale: compose the scene into a smaller target and stretch it at
+ * present. That is the same thing borderless already does with the internal
+ * target, so this drives THAT rather than keeping a second FBO of its own --
+ * every bind in this file asks GR_ScreenFBO for the answer, and two owners
+ * would have fought over it. */
+int  GR_SetInternalResolution(int w, int h);
+extern "C" void GR_ApplyPresentSize(int realW, int realH);
+extern GLuint g_internalFBO;
+
+void GR_ApplyRenderScale(void)
+{
+	float s = g_cfg_renderScale;
+	int   w, h;
+
+	if (g_surfaceWidth <= 0 || g_surfaceHeight <= 0)
+		return;
+
+	if (s <= 0.0f || s > 1.0f)
+		s = 1.0f;
+
+	/* Present size first: this is also where borderless decides whether it wants
+	 * the internal target for its own chosen resolution. If it took it, leave it
+	 * alone -- the player asked for that resolution explicitly. */
+	GR_ApplyPresentSize(g_surfaceWidth, g_surfaceHeight);
+
+	if (s >= 0.999f || g_internalFBO != 0)
+		return;
+
+	/* Even dimensions keep the halved PSX buffer maths and the 2:1 blits from
+	 * landing on half pixels. */
+	w = (int)((float)g_surfaceWidth  * s + 0.5f) & ~1;
+	h = (int)((float)g_surfaceHeight * s + 0.5f) & ~1;
+	if (w < 256) w = 256;
+	if (h < 192) h = 192;
+
+	if (GR_SetInternalResolution(w, h))
+	{
+		g_windowWidth  = w;
+		g_windowHeight = h;
+	}
+}
 
 int g_dbg_wireframeMode = 0;
 int g_dbg_texturelessMode = 0;
@@ -317,6 +384,11 @@ float g_PcHudRect[4] = { -160.0f, 160.0f, -120.0f, 120.0f };
  * coordinates a GTE-projected object lands in. Console object picking
  * (pc_pick.c) reads it. Defaults to the 4:3 frame until the first latch. */
 float g_PcWorldOrthoRect[4] = { -160.0f, 160.0f, -120.0f, 120.0f };
+
+/* The same rectangle for whatever the LAST overlay pass drew, 2D menu frames
+ * included. g_PcHudRect deliberately ignores those, so on a 4:3 menu it still
+ * says wide; anything drawn on a menu has to be placed against this one. */
+float g_PcUiRect[4]  = { -160.0f, 160.0f, -120.0f, 120.0f };
 extern "C" void PsyX_GetDrawEnvOffset(float* x, float* y);
 
 int g_cfg_pgxpTextureCorrection = 1;
@@ -425,6 +497,19 @@ static void GR_ApplyTextureFilter(TextureID tex, TexFormat texFormat)
 		magFilter = GL_LINEAR;
 		minFilter = GL_LINEAR;
 
+		/* ES 3.1 promoted glGetTexLevelParameteriv; ES 3.0 has no such entry
+		 * point, so like glDrawBuffer this is a missing SYMBOL and not just a
+		 * capability the probe can answer for. g_grCaps.texLevelParam is false
+		 * on every GLES context anyway, so the branch was already dead here --
+		 * it just has to be dead at compile time too.
+		 *
+		 * The upgrade is simply skipped rather than assumed: mipmaps exist
+		 * only for hi-res pack textures (hires_override.c generates them);
+		 * nothing builds them for base VRAM textures. Asking for
+		 * LINEAR_MIPMAP_LINEAR without them makes the texture INCOMPLETE and it
+		 * samples black, so with no way to tell the two apart here, Trilinear
+		 * and Anisotropic settle for bilinear on GLES. */
+#if !defined(RENDERER_OGLES)
 		if (g_cfg_textureFilter >= 2 && g_grCaps.texLevelParam)
 		{
 			GLint mipW = 0;
@@ -432,6 +517,7 @@ static void GR_ApplyTextureFilter(TextureID tex, TexFormat texFormat)
 			if (mipW > 0)
 				minFilter = GL_LINEAR_MIPMAP_LINEAR;
 		}
+#endif
 	}
 
 	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, minFilter);
@@ -614,6 +700,7 @@ void GR_InitPostProcess(void);
 void GR_PostProcess(void);
 
 int vram_need_update = 1;
+extern "C" { extern unsigned g_PsyX_VramUploads; extern unsigned g_PsyX_DrawCalls; }
 
 /* PC port: runtime gate for framebuffer→VRAM feedback. See PsyX_render.h. */
 int g_PsxSkipFramebufferStore = 0;
@@ -647,12 +734,17 @@ int g_PsxFeedbackStoreAllowed = 0;
  * re-presents it under the new frame's prims. The game sets the flag on
  * freeze ENTRY (same tick) and clears it on exit. */
 int g_PsxPresentLastFrame = 0;
+
 static GLuint g_freezeFrameTex = 0;
 static GLuint g_freezeFrameFBO = 0;
 static int    g_freezeFrameW = 0;
 static int    g_freezeFrameH = 0;
 int           g_freezeFrameValid = 0; /* exposed: game-side grey-flash probe reads it */
 static int    g_freezePresentedThisFrame = 0;
+/* ES3 resolve-blit format matching, see GR_CaptureLastFrame. */
+static int    g_freezeRealloc = 0;
+static int    g_freezeFlipFormat = 0;
+static int    g_freezeAlphaBits = -1;
 int framebuffer_need_update = 0;
 
 #if defined(__EMSCRIPTEN__) || defined(__RPI__) || defined(__ANDROID__)
@@ -884,9 +976,17 @@ static int    s_suppressWindowMsaa = 0;
 
 extern "C" void GR_MarkTextureNearest(TextureID tex);
 
+/* PSYX_DEFAULT_FBO, not a literal 0, when no internal target is active: on
+ * iOS SDL composes into its own framebuffer object and 0 is not the screen.
+ * Compile-time 0 everywhere else, so this is the value it always was. */
 extern "C" GLuint GR_ScreenFBO(void)
 {
-	return g_internalFBO;
+	/* Zero is not "the screen" on every platform -- see PSYX_DEFAULT_FBO. iOS
+	 * renders into a framebuffer SDL builds around a CAEAGLLayer, whose name the
+	 * driver picks, so binding 0 there selects a framebuffer that does not
+	 * exist and every draw is silently discarded. Compile-time 0 elsewhere, so
+	 * the internal-target path is unchanged for every other target. */
+	return g_internalFBO ? g_internalFBO : (GLuint)PSYX_DEFAULT_FBO;
 }
 
 extern "C" void GR_ApplyPresentSize(int realW, int realH);
@@ -927,7 +1027,11 @@ extern "C" GLuint GR_ScreenReadFBO(void)
 		return s_resolveFBO;
 	}
 
-	return g_internalFBO;
+	/* Same fallback as GR_ScreenFBO: with no internal target this means "read
+	 * the screen", which is not framebuffer 0 on iOS. Reading 0 there is not an
+	 * error the caller sees -- the blit just produces nothing, which is how the
+	 * pause/map freeze capture came back as a flat grey field. */
+	return g_internalFBO ? g_internalFBO : (GLuint)PSYX_DEFAULT_FBO;
 }
 
 /* Where the internal target lands inside the real window.
@@ -1041,7 +1145,7 @@ int GR_SetInternalResolution(int w, int h)
 	glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_DEPTH_STENCIL_ATTACHMENT, GL_RENDERBUFFER, s_internalDepthRbo);
 
 	st = glCheckFramebufferStatus(GL_FRAMEBUFFER);
-	glBindFramebuffer(GL_FRAMEBUFFER, 0);
+	glBindFramebuffer(GL_FRAMEBUFFER, PSYX_DEFAULT_FBO);
 
 	if (st != GL_FRAMEBUFFER_COMPLETE)
 	{
@@ -1056,7 +1160,7 @@ int GR_SetInternalResolution(int w, int h)
 		glBindFramebuffer(GL_FRAMEBUFFER, s_resolveFBO);
 		glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, s_internalColorTex, 0);
 		st = glCheckFramebufferStatus(GL_FRAMEBUFFER);
-		glBindFramebuffer(GL_FRAMEBUFFER, 0);
+		glBindFramebuffer(GL_FRAMEBUFFER, PSYX_DEFAULT_FBO);
 
 		if (st != GL_FRAMEBUFFER_COMPLETE)
 		{
@@ -1150,6 +1254,15 @@ int GR_InitialiseGLContext(char* windowName, int fullscreen)
 
 #if defined(__ANDROID__)
 	windowFlags |= SDL_WINDOW_FULLSCREEN;
+#elif defined(PSYX_IOS)
+	/* A phone has no windowed mode, so the config's fullscreen setting is
+	 * meaningless here and its 640x480 would otherwise be taken literally.
+	 *
+	 * ALLOW_HIGHDPI is what makes the difference between rendering at points
+	 * and rendering at pixels: without it SDL hands back a 956x440 drawable on
+	 * a 16 Pro Max and iOS upscales the result. With it the drawable is the
+	 * panel's real 2868x1320. */
+	windowFlags |= SDL_WINDOW_FULLSCREEN | SDL_WINDOW_ALLOW_HIGHDPI | SDL_WINDOW_BORDERLESS;
 #else
 	/* 0 = windowed, 1 = exclusive fullscreen, 2 = borderless (fullscreen
 	 * desktop: covers the screen at desktop resolution, no mode switch). */
@@ -1195,18 +1308,6 @@ int GR_InitialiseGLContext(char* windowName, int fullscreen)
 
 #if defined(RENDERER_OGLES)
 
-#if defined(__ANDROID__)
-	//Override to full screen.
-	SDL_DisplayMode displayMode;
-	if (SDL_GetCurrentDisplayMode(0, &displayMode) == 0)
-	{
-		screenWidth = displayMode.w;
-		windowWidth = displayMode.w;
-		screenHeight = displayMode.h;
-		windowHeight = displayMode.h;
-	}
-#endif
-
 	//SDL_GL_SetAttribute(SDL_GL_CONTEXT_EGL, 1);
 	SDL_GL_SetAttribute(SDL_GL_CONTEXT_MAJOR_VERSION, OGLES_VERSION);
 	SDL_GL_SetAttribute(SDL_GL_CONTEXT_MINOR_VERSION, 0);
@@ -1217,6 +1318,30 @@ int GR_InitialiseGLContext(char* windowName, int fullscreen)
 		eprinterr("Failed to initialise - OpenGL ES %d.x is not supported.\n", OGLES_VERSION);
 		return 0;
 	}
+
+#if defined(__ANDROID__) || defined(PSYX_IOS)
+	/* Both phones hand back a fullscreen surface whose size is the display's,
+	 * not the one requested of SDL_CreateWindow. g_windowWidth/Height feed the
+	 * viewport and the aspect-corrected cull bounds, so they have to be the real
+	 * drawable size or every clip rect is computed against the wrong extents.
+	 * (The upstream block that used to sit here assigned to screenWidth/
+	 * windowWidth — names this fork does not have — and ran before the window
+	 * existed, so it could never have taken effect anyway.)
+	 *
+	 * iOS was left out of this originally and kept the config's 640x480, so the
+	 * viewport covered a corner of a 2868x1320 panel and the picture sat inset
+	 * with dead space beside it. */
+	{
+		int drawableW = 0, drawableH = 0;
+		SDL_GL_GetDrawableSize(g_window, &drawableW, &drawableH);
+		if (drawableW > 0 && drawableH > 0)
+		{
+			g_surfaceWidth  = drawableW;
+			g_surfaceHeight = drawableH;
+			GR_ApplyRenderScale();
+		}
+	}
+#endif
 
 #elif defined(RENDERER_OGL)
 
@@ -1411,6 +1536,12 @@ static void GR_ProbeCapabilities(void)
 	}
 }
 
+#if defined(PSYX_IOS)
+/* See PSYX_DEFAULT_FBO in PsyX_render.h. Resolved below, before anything has
+ * had a chance to bind a framebuffer of its own. */
+extern "C" unsigned int g_PsyX_DefaultFBO = 0;
+#endif
+
 int GR_InitialiseGLExt()
 {
 #ifdef USE_GLAD
@@ -1445,6 +1576,18 @@ int GR_InitialiseGLExt()
 	 * functions this renderer needs. Both, in this order. */
 	if (g_grIsGLES)
 		gladLoadGLES2Loader(loader);
+#endif
+
+#if defined(PSYX_IOS)
+	/* SDL's UIKit backend has its CAEAGLLayer framebuffer bound at this point.
+	 * Whatever name it got is what "back to the screen" means for the rest of
+	 * the run; 0 would be a framebuffer that does not exist. */
+	{
+		GLint fbo = 0;
+		glGetIntegerv(GL_FRAMEBUFFER_BINDING, &fbo);
+		g_PsyX_DefaultFBO = (unsigned int)fbo;
+		eprintf("*Default framebuffer: %u\n", g_PsyX_DefaultFBO);
+	}
 #endif
 
 	const char* rend = (const char*)glGetString(GL_RENDERER);
@@ -1515,12 +1658,45 @@ static int GR_SceneAlwaysOffscreen(void)
 
 extern "C" void GR_ApplyPresentSize(int realW, int realH)
 {
+#if defined(PSYX_IOS)
+	/* Every caller hands this WINDOW POINTS -- SDL_GetWindowSize at the end of
+	 * GR_InitialiseGLContext, and event.window.data1/2 from a resize. On a
+	 * desktop those are pixels and the distinction does not exist. On iOS with
+	 * ALLOW_HIGHDPI they are a THIRD of the drawable: 956x440 against a
+	 * 2868x1320 panel. Assigning them below put the viewport in one corner of
+	 * the screen (GL origin is bottom-left, hence bottom-left), and took the
+	 * aspect-corrected cull bounds with it.
+	 *
+	 * There is exactly one correct answer for this size on a phone, so it is
+	 * resolved here rather than at each caller -- a new caller cannot get it
+	 * wrong, and the rotation resize is corrected for free. */
+	if (g_window)
+	{
+		int drawableW = 0, drawableH = 0;
+
+		SDL_GL_GetDrawableSize(g_window, &drawableW, &drawableH);
+		if (drawableW > 0 && drawableH > 0)
+		{
+			realW = drawableW;
+			realH = drawableH;
+		}
+	}
+#endif
+
 	if (realW <= 0 || realH <= 0)
 		return;
 
 	g_presentWidth  = realW;
 	g_presentHeight = realH;
 
+	/* Never on iOS. The internal target exists so borderless can render at a
+	 * chosen resolution and stretch to the desktop; a phone has no window mode
+	 * and no resolution to choose, and g_windowWidth/Height there are the
+	 * panel's real drawable, published back into the config at startup. Letting
+	 * a hand-edited config.cfg set fullscreen = 2 would point the scene at a
+	 * 640x480 target and stretch it, for no gain -- and the row that would let
+	 * anyone pick that is already compiled out of the iOS options menu. */
+#if !defined(PSYX_IOS)
 	if (g_cfgFullscreenMode == 2 && g_cfgRenderWidth > 0 && g_cfgRenderHeight > 0 &&
 	    (g_cfgRenderWidth != realW || g_cfgRenderHeight != realH) &&
 	    GR_SetInternalResolution(g_cfgRenderWidth, g_cfgRenderHeight))
@@ -1530,6 +1706,7 @@ extern "C" void GR_ApplyPresentSize(int realW, int realH)
 
 		return;
 	}
+#endif
 
 	if (GR_SceneAlwaysOffscreen() && GR_SetInternalResolution(realW, realH))
 	{
@@ -1546,8 +1723,9 @@ extern "C" void GR_ApplyPresentSize(int realW, int realH)
 
 int GR_InitialiseRender(char* windowName, int width, int height, int fullscreen)
 {
-	g_windowWidth = width;
-	g_windowHeight = height;
+	g_surfaceWidth  = width;
+	g_surfaceHeight = height;
+	GR_ApplyRenderScale();
 
 	/* Remember the request before SDL gets a chance to replace it. */
 	g_cfgRenderWidth    = width;
@@ -2451,7 +2629,7 @@ int g_PsxFogToBlack = 0;
 const char* gte_shader_4 =
 	"AFFINE_VARYING vec4 v_texcoord;\n"
 	"varying vec4 v_color;\n"
-	"AFFINE_VARYING vec4 v_page_clut;\n"
+	"PAGE_CLUT_VARYING vec4 v_page_clut;\n"
 	"varying float v_z;\n"
 	"varying float v_fogAmount;\n"
 	"varying float v_is3d;\n"
@@ -2469,7 +2647,7 @@ const char* gte_shader_4 =
 const char* gte_shader_8 =
 	"AFFINE_VARYING vec4 v_texcoord;\n"
 	"varying vec4 v_color;\n"
-	"AFFINE_VARYING vec4 v_page_clut;\n"
+	"PAGE_CLUT_VARYING vec4 v_page_clut;\n"
 	"varying float v_z;\n"
 	"varying float v_fogAmount;\n"
 	"varying float v_is3d;\n"
@@ -2487,7 +2665,7 @@ const char* gte_shader_8 =
 const char* gte_shader_16 =
 	"AFFINE_VARYING vec4 v_texcoord;\n"
 	"varying vec4 v_color;\n"
-	"AFFINE_VARYING vec4 v_page_clut;\n"
+	"PAGE_CLUT_VARYING vec4 v_page_clut;\n"
 	"varying float v_z;\n"
 	"varying float v_fogAmount;\n"
 	"varying float v_is3d;\n"
@@ -2505,7 +2683,7 @@ const char* gte_shader_16 =
 const char* gte_shader_32_rgba =
 	"AFFINE_VARYING vec4 v_texcoord;\n"
 	"varying vec4 v_color;\n"
-	"AFFINE_VARYING vec4 v_page_clut;\n"
+	"PAGE_CLUT_VARYING vec4 v_page_clut;\n"
 	"varying float v_z;\n"
 	"varying float v_fogAmount;\n"
 	"varying float v_is3d;\n"
@@ -2626,6 +2804,16 @@ ShaderID GR_Shader_Compile(const char* source)
 		"precision highp float;\n"
 		"#define fragColor gl_FragColor\n";
 #elif defined(ES3_SHADERS)
+	/* highp int, NOT lowp. GLSL ES only guarantees 9 bits for a lowp int
+	 * (-256..255), and this shader does integer work on PSX quantities that are
+	 * nowhere near that small: 16-bit Z depths, VRAM texel coordinates across a
+	 * 1024x512 page, CLUT and tpage indices. With lowp every one of them
+	 * truncated and the world came out as a single flat colour on device.
+	 *
+	 * It read as harmless because desktop GLSL PARSES precision qualifiers and
+	 * then ignores them -- they exist only so ES source compiles -- so the same
+	 * line is a no-op at 140 and fatal at 300 es. ES3 guarantees highp int in
+	 * both stages, so asking for it is free here. */
 	const char* GLSL_HEADER_VERT =
 		"#version 300 es\n"
 		"precision highp int;\n"
@@ -2761,10 +2949,42 @@ ShaderID GR_Shader_Compile(const char* source)
 	{
 #if defined(RENDERER_OGLES)
 		tcNoPerspective = "";
+		/* Say so once rather than let `affine_textures = 1` look like it took
+		 * effect. Shaders compile here per program, so gate the notice. */
+		static bool s_affineUnavailableLogged = false;
+		if (!s_affineUnavailableLogged)
+		{
+			s_affineUnavailableLogged = true;
+			eprintwarn("affine_textures is on, but GLSL ES has no `noperspective` "
+			           "qualifier - texture mapping stays perspective-correct "
+			           "(no PSX UV warping) on this renderer.\n");
+		}
 #else
 		tcNoPerspective = g_grCaps.noperspective ? "noperspective " : "";
 #endif
 	}
+
+	/* v_page_clut is NOT a colour or a coordinate: .xy is the VRAM texture-page
+	 * origin and .zw is the CLUT (palette) address, both exact texel addresses
+	 * and both constant across a primitive. Desktop declares them
+	 * `noperspective`, which for a constant is exact. GLSL ES has no such
+	 * qualifier, and dropping it leaves the default `smooth` -- perspective-
+	 * correct, i.e. divided through an interpolated 1/w. A 2D prim has constant
+	 * w so the value survives, which is why the menus, logos and FMVs were fine;
+	 * a 3D world triangle has varying w, so the palette address drifts across
+	 * the face and every texel resolves against the wrong CLUT row. That is the
+	 * flat-coloured world.
+	 *
+	 * `flat` is the correct qualifier for a per-primitive constant and ES3 has
+	 * it. v_texcoord genuinely does need interpolating, so only the page/CLUT
+	 * pair changes. */
+#if defined(ES3_SHADERS)
+	strcat(extra_vs_defines, "#define PAGE_CLUT_VARYING flat out\n");
+	strcat(extra_fs_defines, "#define PAGE_CLUT_VARYING flat in\n");
+#else
+	strcat(extra_vs_defines, "#define PAGE_CLUT_VARYING AFFINE_VARYING\n");
+	strcat(extra_fs_defines, "#define PAGE_CLUT_VARYING AFFINE_VARYING\n");
+#endif
 
 	{
 		char affineDef[128];
@@ -3029,7 +3249,12 @@ int GR_InitialisePSX()
 	 * the sample count the driver actually granted (may differ from requested). */
 	if (g_cfg_msaaSamples > 0)
 	{
+#if !defined(RENDERER_OGLES)
+		/* GLES has no GL_MULTISAMPLE toggle — rasterisation is multisampled
+		 * whenever the framebuffer is, so there is nothing to enable there.
+		 * The granted-sample-count check below still applies. */
 		glEnable(GL_MULTISAMPLE);
+#endif
 		int actualSamples = 0;
 		SDL_GL_GetAttribute(SDL_GL_MULTISAMPLESAMPLES, &actualSamples);
 		eprintf("*MSAA: requested %dx, got %dx\n", g_cfg_msaaSamples, actualSamples);
@@ -3134,6 +3359,21 @@ int GR_InitialisePSX()
 			glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, g_vramTexture, 0);
 			glFramebufferTexture2D(GL_FRAMEBUFFER, GL_DEPTH_ATTACHMENT, GL_TEXTURE_2D, 0, 0);
 			glFramebufferTexture2D(GL_FRAMEBUFFER, GL_STENCIL_ATTACHMENT, GL_TEXTURE_2D, 0, 0);
+
+			/* Every render-to-VRAM pass goes through this FBO. If the driver
+			 * rejects the attachment format the writes are silently dropped and
+			 * everything sampling VRAM reads a constant, which on screen is a
+			 * world in one flat colour and nothing in the log. Say so instead. */
+			{
+				const GLenum fbStatus = glCheckFramebufferStatus(GL_FRAMEBUFFER);
+				const GLenum glErr    = glGetError();
+				eprintinfo("[VRAM-FBO] status=0x%04X (%s) glError=0x%04X internalFormat=0x%04X format=0x%04X %dx%d\n",
+				           (unsigned)fbStatus,
+				           fbStatus == GL_FRAMEBUFFER_COMPLETE ? "COMPLETE" : "INCOMPLETE",
+				           (unsigned)glErr,
+				           (unsigned)VRAM_INTERNAL_FORMAT, (unsigned)VRAM_FORMAT,
+				           VRAM_WIDTH, VRAM_HEIGHT);
+			}
 
 			glBindFramebuffer(GL_FRAMEBUFFER, GR_ScreenFBO());
 		}
@@ -3946,6 +4186,7 @@ void GR_Clear(int x, int y, int w, int h, unsigned char r, unsigned char g, unsi
 #endif
 
 #if USE_OPENGL
+
 	/* PC port: when pillarboxing (4:3 content centered in a wider window), keep
 	 * the side bars black even when the game clears the framebuffer to a
 	 * non-black color. The item-examine ("story item") screen clears to the gray
@@ -4218,22 +4459,14 @@ extern "C" int PsyX_MapWindowToViewport(int mx, int my, float* outFracX, float* 
 {
 	int vpX = 0, vpY = 0, vpW = g_windowWidth, vpH = g_windowHeight;
 
-	/* mx/my arrive in WINDOW pixels from SDL, but everything below works in
-	 * render pixels. Those are the same thing except in borderless with an
-	 * internal target, where the scene is drawn smaller and stretched at
-	 * present -- so scale the pointer by the same factor or the cursor drifts
-	 * from what it is pointing at. Single conversion point, so every mouse
-	 * consumer is corrected at once. */
-	if (g_internalFBO != 0 && g_presentWidth > 0 && g_presentHeight > 0)
+	/* mx/my arrive in real window pixels; everything below is in render pixels,
+	 * which differ once render scaling is on. Convert first, or every touch and
+	 * click lands scaled-down toward the top-left. */
+	if (g_surfaceWidth > 0 && g_surfaceHeight > 0 &&
+	    (g_surfaceWidth != g_windowWidth || g_surfaceHeight != g_windowHeight))
 	{
-		int dx, dy, dw, dh;
-		GR_PresentRect(&dx, &dy, &dw, &dh);
-
-		if (dw > 0 && dh > 0)
-		{
-			mx = (int)((float)(mx - dx) * (float)g_windowWidth  / (float)dw);
-			my = (int)((float)(my - dy) * (float)g_windowHeight / (float)dh);
-		}
+		mx = (int)((float)mx * (float)g_windowWidth  / (float)g_surfaceWidth  + 0.5f);
+		my = (int)((float)my * (float)g_windowHeight / (float)g_surfaceHeight + 0.5f);
 	}
 	const bool wantPillarbox =
 		(g_PcHorPlusEnabled && g_PcWidescreenMode == 0) ||
@@ -4465,13 +4698,19 @@ void GR_SetOffscreenState(const RECT16* offscreenRect, int enable)
 			 * Latched on gameplay frames only (the flag is 0 on menu frames) so a
 			 * menu's 4:3 ortho cannot move it. The vertical span is the real one
 			 * too, so a 224-line display no longer masquerades as 240. */
-			if (g_PcHorPlusEnabled && g_PsxUIOrthoPass) {
+			if (g_PsxUIOrthoPass) {
 				float ox = 0.0f, oy = 0.0f;
 				PsyX_GetDrawEnvOffset(&ox, &oy);
-				g_PcHudRect[0] = fbOrthoL - ox;
-				g_PcHudRect[1] = fbOrthoR - ox;
-				g_PcHudRect[2] = fbOrthoT - oy;
-				g_PcHudRect[3] = fbOrthoB - oy;
+				g_PcUiRect[0] = fbOrthoL - ox;
+				g_PcUiRect[1] = fbOrthoR - ox;
+				g_PcUiRect[2] = fbOrthoT - oy;
+				g_PcUiRect[3] = fbOrthoB - oy;
+				if (g_PcHorPlusEnabled) {
+					g_PcHudRect[0] = g_PcUiRect[0];
+					g_PcHudRect[1] = g_PcUiRect[1];
+					g_PcHudRect[2] = g_PcUiRect[2];
+					g_PcHudRect[3] = g_PcUiRect[3];
+				}
 			}
 
 			/* Same latch for the world pass, for console object picking. */
@@ -5182,9 +5421,11 @@ static void GR_EnsureShadowTarget(void)
 	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
 	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
 	/* CLAMP_TO_BORDER and the border colour are desktop GL / ES 3.2; ES 3.0 has
-	 * neither. CLAMP_TO_EDGE is a safe stand-in here because the fragment shader
-	 * already rejects receivers outside 0..1 in the light frustum before it ever
-	 * samples, so the border texels are never observed. */
+	 * neither, and on a GLES build the tokens are not even declared -- so this
+	 * is a compile-time split rather than the runtime g_grIsGLES test the
+	 * desktop build can afford. CLAMP_TO_EDGE is a safe stand-in either way: the
+	 * fragment shader already rejects receivers outside 0..1 in the light
+	 * frustum before it ever samples, so the border texels are never observed. */
 	if (!g_grIsGLES)
 	{
 		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_BORDER);
@@ -5204,6 +5445,15 @@ static void GR_EnsureShadowTarget(void)
 	glFramebufferTexture2D(GL_FRAMEBUFFER, GL_DEPTH_ATTACHMENT, GL_TEXTURE_2D, g_shadowDepthTex, 0);
 	/* Depth-only target. ES 3.0 dropped the singular glDrawBuffer in favour of
 	 * the array form, which takes the same GL_NONE. */
+	/* Unlike the enums shimmed in PsyX_render.h, this one is a FUNCTION: a GLES
+	 * build has no symbol to link against, so the capability test cannot be the
+	 * only guard. g_grCaps.drawBuffer is false on every GLES context anyway. */
+#if defined(RENDERER_OGLES)
+	{
+		const GLenum none = GL_NONE;
+		glDrawBuffers(1, &none);
+	}
+#else
 	if (g_grCaps.drawBuffer)
 		glDrawBuffer(GL_NONE);
 	else
@@ -5211,6 +5461,7 @@ static void GR_EnsureShadowTarget(void)
 		const GLenum none = GL_NONE;
 		glDrawBuffers(1, &none);
 	}
+#endif
 	glReadBuffer(GL_NONE);
 
 	/* An incomplete shadow FBO does not fail loudly -- it just makes every
@@ -5359,6 +5610,10 @@ void GR_ShadowPassDraw(int startVertex, int numVerts) { (void)startVertex; (void
 void GR_ShadowPassEnd(void) {}
 #endif
 
+/* Bind (creating/resizing as needed) the scaled offscreen target for this
+ * frame. No-op at scale 1.0, which leaves the original render-to-window path
+ * byte for byte. */
+
 /* See g_PsxPresentLastFrame above. Called from PsyX_EndScene after the
  * frame is fully composed in the backbuffer, before the swap. */
 void GR_CaptureLastFrame(void)
@@ -5372,18 +5627,58 @@ void GR_CaptureLastFrame(void)
 		return;
 	}
 
+	/* Low-end: this is a full-screen copy on EVERY frame, purely so that a pause
+	 * which may never come has an image ready. Capturing every 4th frame makes
+	 * the frozen image at most 3 frames stale -- invisible on a pause screen --
+	 * for a quarter of the cost. */
+	if (g_cfg_lowEnd)
+	{
+		static unsigned s_capTick = 0;
+
+		if ((++s_capTick & 3) != 0 && g_freezeFrameValid)
+			return;
+	}
+
 	if (!g_freezeFrameTex)
 	{
 		glGenTextures(1, &g_freezeFrameTex);
 		glGenFramebuffers(1, &g_freezeFrameFBO);
 	}
 
-	if (g_freezeFrameW != g_windowWidth || g_freezeFrameH != g_windowHeight)
+	if (g_freezeFrameW != g_windowWidth || g_freezeFrameH != g_windowHeight || g_freezeRealloc)
 	{
-		g_freezeFrameW = g_windowWidth;
-		g_freezeFrameH = g_windowHeight;
+		g_freezeFrameW  = g_windowWidth;
+		g_freezeFrameH  = g_windowHeight;
+		g_freezeRealloc = 0;
 		glBindTexture(GL_TEXTURE_2D, g_freezeFrameTex);
+#if defined(ES3_SHADERS)
+		/* The blit below is a multisample RESOLVE whenever MSAA is on, and ES3
+		 * rejects a resolve outright unless the read and draw buffers have
+		 * IDENTICAL formats -- desktop GL happily converts. A fixed GL_RGBA8
+		 * against a window with no alpha therefore failed with INVALID_OPERATION
+		 * every frame, leaving the freeze texture black: the black pause screen.
+		 *
+		 * Match the window instead of assuming. If the guess is still refused,
+		 * the error path below flips it once and re-allocates, so an odd EGL
+		 * config resolves itself rather than silently showing black forever. */
+		{
+			int alphaBits = 8;
+
+			if (SDL_GL_GetAttribute(SDL_GL_ALPHA_SIZE, &alphaBits) != 0)
+				alphaBits = 8;
+			if (g_freezeFlipFormat)
+				alphaBits = (alphaBits > 0) ? 0 : 8;
+
+			if (alphaBits > 0)
+				glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, g_freezeFrameW, g_freezeFrameH, 0, GL_RGBA, GL_UNSIGNED_BYTE, NULL);
+			else
+				glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB8,  g_freezeFrameW, g_freezeFrameH, 0, GL_RGB,  GL_UNSIGNED_BYTE, NULL);
+
+			g_freezeAlphaBits = alphaBits;
+		}
+#else
 		glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, g_freezeFrameW, g_freezeFrameH, 0, GL_RGBA, GL_UNSIGNED_BYTE, NULL);
+#endif
 		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
 		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
 		glBindTexture(GL_TEXTURE_2D, 0);
@@ -5394,14 +5689,64 @@ void GR_CaptureLastFrame(void)
 	glFramebufferTexture2D(GL_DRAW_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, g_freezeFrameTex, 0);
 	glBindFramebuffer(GL_READ_FRAMEBUFFER, GR_ScreenReadFBO());
 
+	/* Clear the error state FIRST. This frame already carries a recurring
+	 * 0x0502 from elsewhere (see the GR_SwapWindow drain), and glGetError
+	 * returns the oldest error, so checking after the blit without draining
+	 * first blames this call for someone else's failure -- which is exactly
+	 * what it did: it reported a capture that had actually succeeded. */
+	{
+		int guard = 0;
+		while (glGetError() != GL_NO_ERROR && ++guard < 8) { }
+	}
+
 	glBlitFramebuffer(0, 0, g_windowWidth, g_windowHeight,
 		0, 0, g_freezeFrameW, g_freezeFrameH,
 		GL_COLOR_BUFFER_BIT, GL_NEAREST);
 
+	/* Report once whether the capture actually happened. g_freezeFrameValid used
+	 * to be set unconditionally, so a capture that failed still counted as good
+	 * and pause presented a black texture with no clue why -- which is exactly
+	 * what Android shows. With MSAA the read buffer is multisample, making this
+	 * a resolve blit, and ES3 rejects those on any format/size mismatch. */
+	{
+		static int s_reported = 0;
+		GLenum     err = glGetError();
+
+		if (err != GL_NO_ERROR)
+		{
+			/* Only ever mark the capture good when it really succeeded --
+			 * setting this unconditionally is what made a failed capture
+			 * present as a black screen with nothing to point at. */
+			if (s_reported < 3)
+			{
+				s_reported++;
+				eprintwarn("[FREEZE] capture %dx%d FAILED err=0x%04X msaa=%d fbo=0x%04X%s\n",
+					g_freezeFrameW, g_freezeFrameH, (unsigned)err, g_cfg_msaaSamples,
+					(unsigned)glCheckFramebufferStatus(GL_DRAW_FRAMEBUFFER),
+					g_freezeFlipFormat ? "" : " - retrying with the other format");
+			}
+
+			if (!g_freezeFlipFormat)
+			{
+				g_freezeFlipFormat = 1;
+				g_freezeRealloc    = 1;
+			}
+		}
+		else
+		{
+			if (!s_reported)
+			{
+				s_reported = 1;
+				eprintinfo("[FREEZE] capture %dx%d ok (msaa=%d, %s)\n",
+					g_freezeFrameW, g_freezeFrameH, g_cfg_msaaSamples,
+					g_freezeAlphaBits > 0 ? "RGBA8" : "RGB8");
+			}
+			g_freezeFrameValid = 1;
+		}
+	}
+
 	glBindFramebuffer(GL_READ_FRAMEBUFFER, GR_ScreenReadFBO());
 	glBindFramebuffer(GL_DRAW_FRAMEBUFFER, GR_ScreenFBO());
-
-	g_freezeFrameValid = 1;
 #endif
 }
 
@@ -5418,11 +5763,44 @@ void GR_PresentLastFrame(void)
 	/* MSAA: the default framebuffer is multisample, and a single-sample ->
 	 * multisample glBlitFramebuffer is illegal. Draw the captured frame as a
 	 * full-screen textured triangle instead (writing into the multisample FBO
-	 * is fine). */
-	if (g_cfg_msaaSamples > 0 && g_postShader != (ShaderID)-1)
+	 * is fine).
+	 *
+	 * On a GLES target this is the ONLY path, MSAA or not. The blit below
+	 * targets whatever "the screen" is, and on iOS that is a framebuffer SDL
+	 * builds around a CAEAGLLayer rather than a plain window buffer -- the same
+	 * object that already cost this port a session when binding 0 silently
+	 * discarded every draw. Blitting INTO it wedged the first pause hard enough
+	 * that PsyX_BeginScene never reached its own PsyX_Log_Flush, so the log
+	 * stopped mid-frame with no error to point at.
+	 *
+	 * A shader draw into the currently-bound framebuffer asks nothing special of
+	 * the driver and is the path the MSAA case has been using all along, so this
+	 * is reusing something already proven rather than adding a new one. Desktop
+	 * keeps the blit: it is cheaper, and a plain window buffer has none of this
+	 * trouble. */
+#if defined(RENDERER_OGLES)
+	const int drawRatherThanBlit = 1;
+#else
+	const int drawRatherThanBlit = (g_cfg_msaaSamples > 0);
+#endif
+
+	if (g_postShader != (ShaderID)-1 && drawRatherThanBlit)
 	{
 		GR_DrawFullscreenTexture(g_freezeFrameTex, 0);
 		g_freezePresentedThisFrame = 1;
+
+		/* One line, once: this path had never executed on a phone before the
+		 * capture started succeeding, and a silent hang here is expensive to
+		 * diagnose remotely. */
+		{
+			static int s_presentLogged = 0;
+			if (!s_presentLogged)
+			{
+				s_presentLogged = 1;
+				eprintinfo("[FREEZE] present %dx%d via fullscreen draw\n",
+				           g_freezeFrameW, g_freezeFrameH);
+			}
+		}
 		return;
 	}
 #endif
@@ -6423,11 +6801,18 @@ void GR_ReadVRAM(unsigned short* dst, int x, int y, int dst_w, int dst_h)
 	}
 }
 
+/* Counters for the per-256-frame [PERF] line. A full VRAM upload is 1MB and
+ * alternates between two textures, so the driver cannot reuse either -- if this
+ * runs every frame it dominates everything else on a mobile GPU, and no amount
+ * of lowering the render scale would show it. */
+extern "C" { unsigned g_PsyX_VramUploads = 0; unsigned g_PsyX_DrawCalls = 0; }
+
 void GR_UpdateVRAM()
 {
 	if (!vram_need_update)
 		return;
 
+	g_PsyX_VramUploads++;
 	vram_need_update = 0;
 
 #if USE_OPENGL
@@ -6450,6 +6835,7 @@ void GR_UpdateVRAM()
 #else
 	glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, VRAM_WIDTH, VRAM_HEIGHT, VRAM_FORMAT, GL_UNSIGNED_BYTE, vram);
 #endif
+
 
 	GR_RestoreStoredFramebufferRegion();
 
@@ -6697,7 +7083,7 @@ void GR_SwapWindow()
 		GR_PresentRect(&dx, &dy, &dw, &dh);
 
 		glBindFramebuffer(GL_READ_FRAMEBUFFER, src);
-		glBindFramebuffer(GL_DRAW_FRAMEBUFFER, 0);
+		glBindFramebuffer(GL_DRAW_FRAMEBUFFER, PSYX_DEFAULT_FBO);
 		glViewport(0, 0, g_presentWidth, g_presentHeight);
 
 		/* Scissor would clip both the clear and the blit to whatever the frame
@@ -6728,6 +7114,35 @@ void GR_SwapWindow()
 	}
 
 #if defined(RENDERER_OGL) || defined(RENDERER_OGLES)
+	/* Nothing in this renderer checks glGetError, so a state or format the
+	 * driver rejects just produces a wrong image and no message. Drain a BOUNDED
+	 * number per frame: glGetError can keep reporting without ever returning
+	 * GL_NO_ERROR when there is no current context, and an unbounded drain here
+	 * hangs the frame instead of diagnosing it. */
+	{
+		static unsigned s_seenErrBits = 0;
+		static int      s_errLogged   = 0;
+		int             drain;
+		/* glGetError can force a driver sync; on a weak GPU that is a real cost
+		 * for a diagnostic nobody is reading during play. */
+		const int       maxDrain = g_cfg_lowEnd ? 0 : 8;
+		for (drain = 0; drain < maxDrain; drain++)
+		{
+			const GLenum err = glGetError();
+			if (err == GL_NO_ERROR)
+				break;
+			{
+				const unsigned bit = 1u << (err & 0x7);
+				if (!(s_seenErrBits & bit) && s_errLogged < 16)
+				{
+					s_seenErrBits |= bit;
+					s_errLogged++;
+					eprinterr("[GL] glGetError=0x%04X during frame\n", (unsigned)err);
+				}
+			}
+		}
+	}
+
 	if (PsyX_Angle_Active())
 		PsyX_Angle_Swap();
 	else
@@ -7115,6 +7530,7 @@ void GR_UpdateVertexBuffer(const GrVertex* vertices, int num_vertices)
 void GR_DrawTriangles(int start_vertex, int triangles)
 {
 #if USE_OPENGL
+	g_PsyX_DrawCalls++;
 	if (s_gf.draws++ == 0)
 		GreyFrame_FirstDraw();
 	s_gf.tris += triangles;

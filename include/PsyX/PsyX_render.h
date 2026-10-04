@@ -85,6 +85,32 @@
 #   include <EGL/egl.h>
 #endif
 
+/* Desktop-GL / ES 3.2 enums that Apple's ES 3.0 headers do not declare.
+ *
+ * The renderer decides between the desktop and the GLES spelling at RUNTIME
+ * now (g_grCaps, so one binary can serve both native GL and ANGLE's ES). That
+ * works everywhere glad supplies a full enum table regardless of the live
+ * context — but on iOS the tokens are absent from the headers outright, so the
+ * desktop side of each branch will not COMPILE, never mind run.
+ *
+ * These are the canonical values from the GL registry, defined only so those
+ * branches parse. Every one of them sits behind a capability test that is
+ * false on GLES, so none is ever handed to the driver here. */
+/* Android compiles against the NDK's <GLES3/gl3.h>, which is ES 3.0 and lacks
+ * these for exactly the same reason Apple's framework does -- the guard names
+ * iOS only because iOS hit it first. */
+#if defined(PSYX_IOS) || defined(__ANDROID__)
+#   ifndef GL_TEXTURE_WIDTH
+#       define GL_TEXTURE_WIDTH         0x1000
+#   endif
+#   ifndef GL_TEXTURE_BORDER_COLOR
+#       define GL_TEXTURE_BORDER_COLOR  0x1004
+#   endif
+#   ifndef GL_CLAMP_TO_BORDER
+#       define GL_CLAMP_TO_BORDER       0x812D
+#   endif
+#endif
+
 #endif
 
   // setup renderer texture formats
@@ -92,6 +118,34 @@
 #   define TEXTURE_FORMAT GL_UNSIGNED_SHORT_1_5_5_5_REV
 #elif defined(RENDERER_OGLES)
 #   define TEXTURE_FORMAT GL_UNSIGNED_SHORT_5_5_5_1
+#endif
+
+/* "Unbind the framebuffer" is not `0` everywhere.
+ *
+ * On desktop GL and on Android's EGL the window surface IS framebuffer object
+ * 0, so binding 0 puts you back on screen. iOS has no such default: SDL's UIKit
+ * backend renders into a framebuffer it creates around a CAEAGLLayer, and its
+ * name is whatever the driver handed out. Binding 0 there selects a framebuffer
+ * that does not exist, so every draw is silently discarded — the game runs,
+ * audio plays, and the screen stays black.
+ *
+ * Captured once from GL_FRAMEBUFFER_BINDING in GR_InitialiseGLExt, which runs
+ * with SDL's own framebuffer still current. Compile-time 0 everywhere else, so
+ * no other platform's generated code changes. */
+/* Also defined in common/glad.h: PsyCross reaches this header, while pc_port's
+ * GL code includes only glad.h, and on iOS neither includes the other. Both
+ * copies are identical and guarded, so whichever arrives first wins. */
+#ifndef PSYX_DEFAULT_FBO
+#   if defined(PSYX_IOS)
+#       ifdef __cplusplus
+extern "C" unsigned int g_PsyX_DefaultFBO;
+#       else
+extern unsigned int g_PsyX_DefaultFBO;
+#       endif
+#       define PSYX_DEFAULT_FBO (g_PsyX_DefaultFBO)
+#   else
+#       define PSYX_DEFAULT_FBO 0
+#   endif
 #endif
 
 #include "psx/types.h"
@@ -126,7 +180,23 @@
  * driver every frame. RG8 is the same 8-bit-normalised value to the shader, at
  * 1 MB and a straight copy. Costs a few ms on fast drivers; on weak GL 3.1
  * iGPUs the converting path is the difference between playable and ~3 FPS. */
+/* GL_LUMINANCE_ALPHA is an ES2-era format and it is NOT colour-renderable in
+ * GLES 3.0. The VRAM texture is not just sampled -- it is bound as
+ * GL_COLOR_ATTACHMENT0 for the render-to-VRAM passes (see the
+ * glFramebufferTexture2D calls on g_vramTexture) -- so on ES3 those
+ * framebuffers came back INCOMPLETE, every VRAM write was dropped, and
+ * everything that sampled VRAM resolved to one constant. On device that is a
+ * world drawn in a single flat colour, with FMVs unaffected because the FMV
+ * player owns a separate RGBA texture.
+ *
+ * ES 3.0 requires RG8 and lists it as colour-renderable, so it can use exactly
+ * what the desktop path uses. Only ES2 (which has neither) still needs
+ * LUMINANCE_ALPHA, and GPU_FETCH_VRAM_FUNC keys its .ra-vs-.rg swizzle off
+ * VRAM_FORMAT, so the shader follows automatically. */
 #if defined(RENDERER_OGL)
+#	define VRAM_FORMAT            GL_RG
+#	define VRAM_INTERNAL_FORMAT   GL_RG8
+#elif defined(RENDERER_OGLES) && OGLES_VERSION >= 3
 #	define VRAM_FORMAT            GL_RG
 #	define VRAM_INTERNAL_FORMAT   GL_RG8
 #elif defined(RENDERER_OGLES)
